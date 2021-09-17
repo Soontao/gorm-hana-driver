@@ -28,6 +28,8 @@ jobs:
 
       - name: unit test
         run: go test ./... -v -race -coverprofile=coverage.txt -covermode=atomic
+        env: 
+          GORM_TEST_DSN: ${{ secrets.GORM_TEST_DSN }}
 
       - name: codecov
         uses: codecov/codecov-action@v1
