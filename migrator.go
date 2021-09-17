@@ -1,8 +1,10 @@
-package hana
+package hdb
 
 import (
 	"database/sql"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -16,54 +18,37 @@ type Migrator struct {
 }
 
 type Column struct {
-	name              string
-	nullable          sql.NullString
-	datatype          string
-	maxLen            sql.NullInt64
-	precision         sql.NullInt64
-	scale             sql.NullInt64
-	datetimePrecision sql.NullInt64
+	name     string
+	nullable bool
+	datatype string
+	maxLen   uint
+	scale    sql.NullInt64
 }
 
 func (c Column) Name() string {
 	return c.name
 }
 
-func (c Column) DatabaseTypeName() string {
+func (c Column) DatabaseTypeName() (datatype string) {
 	return c.datatype
 }
 
 func (c Column) Length() (int64, bool) {
-	if c.maxLen.Valid {
-		return c.maxLen.Int64, c.maxLen.Valid
-	}
-
-	return 0, false
+	return int64(c.maxLen), true
 }
 
 func (c Column) Nullable() (bool, bool) {
-	if c.nullable.Valid {
-		return c.nullable.String == "YES", true
-	}
-
-	return false, false
+	return c.nullable, true
 }
 
 // DecimalSize return precision int64, scale int64, ok bool
-func (c Column) DecimalSize() (int64, int64, bool) {
-	if c.precision.Valid {
-		if c.scale.Valid {
-			return c.precision.Int64, c.scale.Int64, true
-		}
-
-		return c.precision.Int64, 0, true
+func (c Column) DecimalSize() (precision int64, scale int64, ok bool) {
+	precision = int64(c.maxLen)
+	if c.scale.Valid {
+		scale = c.scale.Int64
 	}
-
-	if c.datetimePrecision.Valid {
-		return c.datetimePrecision.Int64, 0, true
-	}
-
-	return 0, 0, false
+	ok = true
+	return
 }
 
 func (m Migrator) FullDataTypeOf(field *schema.Field) clause.Expr {
@@ -76,16 +61,109 @@ func (m Migrator) FullDataTypeOf(field *schema.Field) clause.Expr {
 	return expr
 }
 
+func (m Migrator) AddColumn(value interface{}, field string) error {
+	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
+		// avoid using the same name field
+		f := stmt.Schema.LookUpField(field)
+		if f == nil {
+			return fmt.Errorf("failed to look up field with name: %s", field)
+		}
+
+		if !f.IgnoreMigration {
+			return m.DB.Exec(
+				"ALTER TABLE ? ADD (? ?)",
+				m.CurrentTable(stmt), clause.Column{Name: f.DBName}, m.DB.Migrator().FullDataTypeOf(f),
+			).Error
+		}
+
+		return nil
+	})
+}
+
 func (m Migrator) AlterColumn(value interface{}, field string) error {
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		if field := stmt.Schema.LookUpField(field); field != nil {
 			return m.DB.Exec(
-				"ALTER TABLE ? MODIFY COLUMN ? ?",
-				clause.Table{Name: stmt.Table}, clause.Column{Name: field.DBName}, m.FullDataTypeOf(field),
+				"ALTER TABLE ? ALTER (? ?)",
+				clause.Table{Name: stmt.Table},
+				clause.Column{Name: field.DBName},
+				m.FullDataTypeOf(field),
 			).Error
 		}
 		return fmt.Errorf("failed to look up field with name: %s", field)
 	})
+}
+
+func (m Migrator) HasTable(value interface{}) bool {
+	var count int64
+
+	m.RunWithValue(value, func(stmt *gorm.Statement) error {
+		currentDatabase := m.DB.Migrator().CurrentDatabase()
+		return m.DB.Raw("SELECT count(*) FROM sys.tables WHERE schema_name = ? AND table_name = ?", currentDatabase, stmt.Table).Row().Scan(&count)
+	})
+
+	return count > 0
+}
+
+func (m Migrator) HasColumn(value interface{}, field string) bool {
+	var count int64
+	m.RunWithValue(value, func(stmt *gorm.Statement) error {
+		currentDatabase := m.DB.Migrator().CurrentDatabase()
+		name := field
+		if field := stmt.Schema.LookUpField(field); field != nil {
+			name = field.DBName
+		}
+
+		return m.DB.Raw(
+			"SELECT count(*) FROM SYS.TABLE_COLUMNS WHERE SCHEMA_NAME = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+			currentDatabase, stmt.Table, name,
+		).Row().Scan(&count)
+	})
+
+	return count > 0
+}
+
+func (m Migrator) CurrentDatabase() (name string) {
+	m.DB.Raw("SELECT CURRENT_SCHEMA FROM DUMMY").Row().Scan(&name)
+	return
+}
+
+func (m Migrator) MigrateColumn(value interface{}, field *schema.Field, columnType gorm.ColumnType) error {
+
+	alterColumn := false
+
+	// check size
+	if length, _ := columnType.Length(); length != int64(field.Size) {
+		// for integer num, size is not works correctly
+		if field.DataType == schema.Int || field.DataType == schema.Uint {
+			if !strings.EqualFold(intFieldToType(field), strings.ToLower(columnType.DatabaseTypeName())) {
+				alterColumn = true
+			}
+		} else if length > 0 && field.Size > 0 {
+			alterColumn = true
+		}
+	}
+
+	// check precision
+	if precision, _, ok := columnType.DecimalSize(); ok && int64(field.Precision) != precision {
+		if regexp.MustCompile(fmt.Sprintf("[^0-9]%d[^0-9]", field.Precision)).MatchString(m.Migrator.DataTypeOf(field)) {
+			alterColumn = true
+		}
+	}
+
+	// check nullable
+	if nullable, ok := columnType.Nullable(); ok && nullable == field.NotNull {
+		// not primary key & database is nullable
+		if !field.PrimaryKey && nullable {
+			alterColumn = true
+		}
+	}
+
+	if alterColumn && !field.IgnoreMigration {
+		return m.DB.Migrator().AlterColumn(value, field.Name)
+	}
+
+	return nil
 }
 
 func (m Migrator) RenameColumn(value interface{}, oldName, newName string) error {
@@ -149,7 +227,6 @@ func (m Migrator) RenameIndex(value interface{}, oldName, newName string) error 
 func (m Migrator) DropTable(values ...interface{}) error {
 	values = m.ReorderModels(values, false)
 	tx := m.DB.Session(&gorm.Session{})
-	tx.Exec("SET FOREIGN_KEY_CHECKS = 0;")
 	for i := len(values) - 1; i >= 0; i-- {
 		if err := m.RunWithValue(values[i], func(stmt *gorm.Statement) error {
 			return tx.Exec("DROP TABLE IF EXISTS ? CASCADE", clause.Table{Name: stmt.Table}).Error
@@ -157,7 +234,6 @@ func (m Migrator) DropTable(values ...interface{}) error {
 			return err
 		}
 	}
-	tx.Exec("SET FOREIGN_KEY_CHECKS = 1;")
 	return nil
 }
 
@@ -181,12 +257,8 @@ func (m Migrator) DropConstraint(value interface{}, name string) error {
 func (m Migrator) ColumnTypes(value interface{}) ([]gorm.ColumnType, error) {
 	columnTypes := make([]gorm.ColumnType, 0)
 	err := m.RunWithValue(value, func(stmt *gorm.Statement) error {
-		var (
-			currentDatabase = m.DB.Migrator().CurrentDatabase()
-			columnTypeSQL   = "SELECT column_name, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_scale "
-		)
-
-		columnTypeSQL += "FROM information_schema.columns WHERE table_schema = ? AND table_name = ?"
+		currentDatabase := m.DB.Migrator().CurrentDatabase()
+		columnTypeSQL := "SELECT column_name, is_nullable, data_type_name, length, scale FROM SYS.TABLE_COLUMNS WHERE schema_name = ? AND table_name = ? ORDER BY POSITION ASC"
 
 		columns, rowErr := m.DB.Raw(columnTypeSQL, currentDatabase, stmt.Table).Rows()
 		if rowErr != nil {
@@ -197,8 +269,13 @@ func (m Migrator) ColumnTypes(value interface{}) ([]gorm.ColumnType, error) {
 
 		for columns.Next() {
 			var column Column
-			var values = []interface{}{&column.name, &column.nullable, &column.datatype,
-				&column.maxLen, &column.precision, &column.scale}
+			var values = []interface{}{
+				&column.name,
+				&column.nullable,
+				&column.datatype,
+				&column.maxLen,
+				&column.scale,
+			}
 
 			if scanErr := columns.Scan(values...); scanErr != nil {
 				return scanErr
