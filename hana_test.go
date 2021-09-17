@@ -1,4 +1,4 @@
-package mysql
+package hana
 
 import (
 	"bytes"
@@ -41,7 +41,7 @@ func TestDialector_QuoteTo(t *testing.T) {
 // Result:
 // goos: darwin
 // goarch: amd64
-// pkg: gorm.io/driver/mysql
+// pkg: gorm.io/driver/hana
 // cpu: Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz
 // BenchmarkDialector_QuoteTo               9184232               113.2 ns/op
 // BenchmarkDialector_QuoteTo-2             9782818               112.3 ns/op

@@ -1,0 +1,33 @@
+# github.com/SAP/go-hdb v0.105.3
+## explicit
+github.com/SAP/go-hdb/driver
+github.com/SAP/go-hdb/driver/dial
+github.com/SAP/go-hdb/driver/hdb
+github.com/SAP/go-hdb/driver/internal/container/vermap
+github.com/SAP/go-hdb/driver/internal/protocol
+github.com/SAP/go-hdb/driver/internal/protocol/encoding
+github.com/SAP/go-hdb/driver/internal/protocol/scanner
+github.com/SAP/go-hdb/driver/internal/rand
+github.com/SAP/go-hdb/driver/sqltrace
+github.com/SAP/go-hdb/driver/unicode/cesu8
+# github.com/go-sql-driver/mysql v1.6.0
+## explicit
+# github.com/jinzhu/inflection v1.0.0
+github.com/jinzhu/inflection
+# github.com/jinzhu/now v1.1.2
+github.com/jinzhu/now
+# golang.org/x/crypto v0.0.0-20210915214749-c084706c2272
+## explicit
+golang.org/x/crypto/pbkdf2
+# golang.org/x/text v0.3.7
+## explicit
+golang.org/x/text/transform
+# gorm.io/gorm v1.21.15
+## explicit
+gorm.io/gorm
+gorm.io/gorm/callbacks
+gorm.io/gorm/clause
+gorm.io/gorm/logger
+gorm.io/gorm/migrator
+gorm.io/gorm/schema
+gorm.io/gorm/utils

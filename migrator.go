@@ -1,4 +1,4 @@
-package mysql
+package hana
 
 import (
 	"database/sql"
@@ -90,9 +90,6 @@ func (m Migrator) AlterColumn(value interface{}, field string) error {
 
 func (m Migrator) RenameColumn(value interface{}, oldName, newName string) error {
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
-		if !m.Dialector.DontSupportRenameColumn {
-			return m.Migrator.RenameColumn(value, oldName, newName)
-		}
 
 		var field *schema.Field
 		if f := stmt.Schema.LookUpField(oldName); f != nil {
@@ -118,14 +115,6 @@ func (m Migrator) RenameColumn(value interface{}, oldName, newName string) error
 }
 
 func (m Migrator) RenameIndex(value interface{}, oldName, newName string) error {
-	if !m.Dialector.DontSupportRenameIndex {
-		return m.RunWithValue(value, func(stmt *gorm.Statement) error {
-			return m.DB.Exec(
-				"ALTER TABLE ? RENAME INDEX ? TO ?",
-				clause.Table{Name: stmt.Table}, clause.Column{Name: oldName}, clause.Column{Name: newName},
-			).Error
-		})
-	}
 
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		err := m.DropIndex(value, oldName)
@@ -197,9 +186,6 @@ func (m Migrator) ColumnTypes(value interface{}) ([]gorm.ColumnType, error) {
 			columnTypeSQL   = "SELECT column_name, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_scale "
 		)
 
-		if !m.DisableDatetimePrecision {
-			columnTypeSQL += ", datetime_precision "
-		}
 		columnTypeSQL += "FROM information_schema.columns WHERE table_schema = ? AND table_name = ?"
 
 		columns, rowErr := m.DB.Raw(columnTypeSQL, currentDatabase, stmt.Table).Rows()
@@ -213,10 +199,6 @@ func (m Migrator) ColumnTypes(value interface{}) ([]gorm.ColumnType, error) {
 			var column Column
 			var values = []interface{}{&column.name, &column.nullable, &column.datatype,
 				&column.maxLen, &column.precision, &column.scale}
-
-			if !m.DisableDatetimePrecision {
-				values = append(values, &column.datetimePrecision)
-			}
 
 			if scanErr := columns.Scan(values...); scanErr != nil {
 				return scanErr

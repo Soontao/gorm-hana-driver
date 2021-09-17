@@ -1,14 +1,11 @@
-package mysql
+package hana
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"math"
-	"strings"
-	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/SAP/go-hdb/driver"
 	"gorm.io/gorm"
 	"gorm.io/gorm/callbacks"
 	"gorm.io/gorm/clause"
@@ -18,16 +15,9 @@ import (
 )
 
 type Config struct {
-	DriverName                string
-	DSN                       string
-	Conn                      gorm.ConnPool
-	SkipInitializeWithVersion bool
-	DefaultStringSize         uint
-	DefaultDatetimePrecision  *int
-	DisableDatetimePrecision  bool
-	DontSupportRenameIndex    bool
-	DontSupportRenameColumn   bool
-	DontSupportForShareClause bool
+	DriverName string
+	DSN        string
+	Conn       gorm.ConnPool
 }
 
 type Dialector struct {
@@ -39,8 +29,6 @@ var (
 	UpdateClauses = []string{"UPDATE", "SET", "WHERE", "ORDER BY", "LIMIT"}
 	// DeleteClauses delete clauses setting
 	DeleteClauses = []string{"DELETE", "FROM", "WHERE", "ORDER BY", "LIMIT"}
-
-	defaultDatetimePrecision = 3
 )
 
 func Open(dsn string) gorm.Dialector {
@@ -52,33 +40,14 @@ func New(config Config) gorm.Dialector {
 }
 
 func (dialector Dialector) Name() string {
-	return "mysql"
-}
-
-// NowFunc return now func
-func (dialector Dialector) NowFunc(n int) func() time.Time {
-	return func() time.Time {
-		round := time.Second / time.Duration(math.Pow10(n))
-		return time.Now().Local().Round(round)
-	}
+	return "hdb"
 }
 
 func (dialector Dialector) Apply(config *gorm.Config) error {
-	if config.NowFunc == nil {
-		if dialector.DefaultDatetimePrecision == nil {
-			dialector.DefaultDatetimePrecision = &defaultDatetimePrecision
-		}
-
-		// while maintaining the readability of the code, separate the business logic from
-		// the general part and leave it to the function to do it here.
-		config.NowFunc = dialector.NowFunc(*dialector.DefaultDatetimePrecision)
-	}
-
 	return nil
 }
 
 func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
-	ctx := context.Background()
 
 	// register callbacks
 	callbacks.RegisterDefaultCallbacks(db, &callbacks.Config{
@@ -87,11 +56,7 @@ func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
 	})
 
 	if dialector.DriverName == "" {
-		dialector.DriverName = "mysql"
-	}
-
-	if dialector.DefaultDatetimePrecision == nil {
-		dialector.DefaultDatetimePrecision = &defaultDatetimePrecision
+		dialector.DriverName = "hdb"
 	}
 
 	if dialector.Conn != nil {
@@ -100,32 +65,6 @@ func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
 		db.ConnPool, err = sql.Open(dialector.DriverName, dialector.DSN)
 		if err != nil {
 			return err
-		}
-	}
-
-	if !dialector.Config.SkipInitializeWithVersion {
-		var version string
-		err = db.ConnPool.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version)
-		if err != nil {
-			return err
-		}
-
-		if strings.Contains(version, "MariaDB") {
-			dialector.Config.DontSupportRenameIndex = true
-			dialector.Config.DontSupportRenameColumn = true
-			dialector.Config.DontSupportForShareClause = true
-		} else if strings.HasPrefix(version, "5.6.") {
-			dialector.Config.DontSupportRenameIndex = true
-			dialector.Config.DontSupportRenameColumn = true
-			dialector.Config.DontSupportForShareClause = true
-		} else if strings.HasPrefix(version, "5.7.") {
-			dialector.Config.DontSupportRenameColumn = true
-			dialector.Config.DontSupportForShareClause = true
-		} else if strings.HasPrefix(version, "5.") {
-			dialector.Config.DisableDatetimePrecision = true
-			dialector.Config.DontSupportRenameIndex = true
-			dialector.Config.DontSupportRenameColumn = true
-			dialector.Config.DontSupportForShareClause = true
 		}
 	}
 
@@ -195,16 +134,6 @@ func (dialector Dialector) ClauseBuilders() map[string]clause.ClauseBuilder {
 			}
 			c.Build(builder)
 		},
-	}
-
-	if dialector.Config.DontSupportForShareClause {
-		clauseBuilders[ClauseFor] = func(c clause.Clause, builder clause.Builder) {
-			if values, ok := c.Expression.(clause.Locking); ok && strings.EqualFold(values.Strength, "SHARE") {
-				builder.WriteString("LOCK IN SHARE MODE")
-				return
-			}
-			c.Build(builder)
-		}
 	}
 
 	return clauseBuilders
@@ -316,14 +245,10 @@ func (dialector Dialector) getSchemaFloatType(field *schema.Field) string {
 func (dialector Dialector) getSchemaStringType(field *schema.Field) string {
 	size := field.Size
 	if size == 0 {
-		if dialector.DefaultStringSize > 0 {
-			size = int(dialector.DefaultStringSize)
-		} else {
-			hasIndex := field.TagSettings["INDEX"] != "" || field.TagSettings["UNIQUE"] != ""
-			// TEXT, GEOMETRY or JSON column can't have a default value
-			if field.PrimaryKey || field.HasDefaultValue || hasIndex {
-				size = 191 // utf8mb4
-			}
+		hasIndex := field.TagSettings["INDEX"] != "" || field.TagSettings["UNIQUE"] != ""
+		// TEXT, GEOMETRY or JSON column can't have a default value
+		if field.PrimaryKey || field.HasDefaultValue || hasIndex {
+			size = 191 // utf8mb4
 		}
 	}
 
@@ -340,9 +265,6 @@ func (dialector Dialector) getSchemaStringType(field *schema.Field) string {
 
 func (dialector Dialector) getSchemaTimeType(field *schema.Field) string {
 	precision := ""
-	if !dialector.DisableDatetimePrecision && field.Precision == 0 {
-		field.Precision = *dialector.DefaultDatetimePrecision
-	}
 
 	if field.Precision > 0 {
 		precision = fmt.Sprintf("(%d)", field.Precision)
