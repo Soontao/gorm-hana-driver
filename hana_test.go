@@ -9,7 +9,7 @@ import (
 )
 
 func TestMigration(t *testing.T) {
-	dsn := os.Getenv("test_dsn")
+	dsn := os.Getenv("GORM_TEST_DSN")
 	if len(dsn) > 0 {
 		type User struct {
 			ID    uint
