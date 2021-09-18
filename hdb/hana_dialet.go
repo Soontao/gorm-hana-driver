@@ -14,12 +14,6 @@ import (
 	"gorm.io/gorm/schema"
 )
 
-type Config struct {
-	DriverName string
-	DSN        string
-	Conn       gorm.ConnPool
-}
-
 type Dialector struct {
 	*Config
 }
@@ -245,21 +239,8 @@ func (dialector Dialector) getSchemaFloatType(field *schema.Field) string {
 func (dialector Dialector) getSchemaStringType(field *schema.Field) string {
 	size := field.Size
 	if size == 0 {
-		hasIndex := field.TagSettings["INDEX"] != "" || field.TagSettings["UNIQUE"] != ""
-		// TEXT, GEOMETRY or JSON column can't have a default value
-		if field.PrimaryKey || field.HasDefaultValue || hasIndex {
-			size = 191 // utf8mb4
-		}
+		size = 255
 	}
-
-	if size >= 65536 && size <= int(math.Pow(2, 24)) {
-		return "nvarchar"
-	}
-
-	if size > int(math.Pow(2, 24)) || size <= 0 {
-		return "nvarchar"
-	}
-
 	return fmt.Sprintf("nvarchar(%d)", size)
 }
 

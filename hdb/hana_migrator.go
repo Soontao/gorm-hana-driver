@@ -1,10 +1,7 @@
 package hdb
 
 import (
-	"database/sql"
 	"fmt"
-	"regexp"
-	"strings"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -15,40 +12,6 @@ import (
 type Migrator struct {
 	migrator.Migrator
 	Dialector
-}
-
-type Column struct {
-	name     string
-	nullable bool
-	datatype string
-	maxLen   uint
-	scale    sql.NullInt64
-}
-
-func (c Column) Name() string {
-	return c.name
-}
-
-func (c Column) DatabaseTypeName() (datatype string) {
-	return c.datatype
-}
-
-func (c Column) Length() (int64, bool) {
-	return int64(c.maxLen), true
-}
-
-func (c Column) Nullable() (bool, bool) {
-	return c.nullable, true
-}
-
-// DecimalSize return precision int64, scale int64, ok bool
-func (c Column) DecimalSize() (precision int64, scale int64, ok bool) {
-	precision = int64(c.maxLen)
-	if c.scale.Valid {
-		scale = c.scale.Int64
-	}
-	ok = true
-	return
 }
 
 func (m Migrator) FullDataTypeOf(field *schema.Field) clause.Expr {
@@ -132,21 +95,19 @@ func (m Migrator) MigrateColumn(value interface{}, field *schema.Field, columnTy
 
 	alterColumn := false
 
-	// check size
-	if length, _ := columnType.Length(); length != int64(field.Size) {
-		// for integer num, size is not works correctly
-		if field.DataType == schema.Int || field.DataType == schema.Uint {
-			if !strings.EqualFold(intFieldToType(field), strings.ToLower(columnType.DatabaseTypeName())) {
-				alterColumn = true
-			}
-		} else if length > 0 && field.Size > 0 {
+	// check precision
+	if precision, scale, ok := columnType.DecimalSize(); ok && field.Precision > 0 {
+		if precision > 0 && precision != int64(field.Precision) {
+			alterColumn = true
+		}
+		if scale > 0 && scale != int64(field.Scale) {
 			alterColumn = true
 		}
 	}
 
-	// check precision
-	if precision, _, ok := columnType.DecimalSize(); ok && int64(field.Precision) != precision {
-		if regexp.MustCompile(fmt.Sprintf("[^0-9]%d[^0-9]", field.Precision)).MatchString(m.Migrator.DataTypeOf(field)) {
+	// for string or blob ?
+	if length, ok := columnType.Length(); ok && length > 0 && field.Size > 0 {
+		if length != int64(field.Size) {
 			alterColumn = true
 		}
 	}
@@ -269,17 +230,19 @@ func (m Migrator) ColumnTypes(value interface{}) ([]gorm.ColumnType, error) {
 
 		for columns.Next() {
 			var column Column
+
 			var values = []interface{}{
 				&column.name,
 				&column.nullable,
 				&column.datatype,
-				&column.maxLen,
+				&column.length,
 				&column.scale,
 			}
 
 			if scanErr := columns.Scan(values...); scanErr != nil {
 				return scanErr
 			}
+
 			columnTypes = append(columnTypes, column)
 		}
 
