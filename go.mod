@@ -8,5 +8,5 @@ require (
 	github.com/stretchr/testify v1.7.0
 	golang.org/x/crypto v0.0.0-20210915214749-c084706c2272 // indirect
 	golang.org/x/text v0.3.7 // indirect
-	gorm.io/gorm v1.21.15
+	gorm.io/gorm v1.23.3
 )
