@@ -1,4 +1,4 @@
-# github.com/SAP/go-hdb v0.105.3
+# github.com/SAP/go-hdb v0.105.5
 ## explicit
 github.com/SAP/go-hdb/driver
 github.com/SAP/go-hdb/driver/dial
@@ -24,11 +24,9 @@ github.com/pmezard/go-difflib/difflib
 # github.com/stretchr/testify v1.7.0
 ## explicit
 github.com/stretchr/testify/assert
-# golang.org/x/crypto v0.0.0-20210915214749-c084706c2272
-## explicit
+# golang.org/x/crypto v0.0.0-20210921155107-089bfa567519
 golang.org/x/crypto/pbkdf2
 # golang.org/x/text v0.3.7
-## explicit
 golang.org/x/text/transform
 # gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c
 gopkg.in/yaml.v3
