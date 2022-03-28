@@ -7,7 +7,7 @@ on:
     branches:
       - "*"
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "53 6 * * *"
 
 jobs:
   build:

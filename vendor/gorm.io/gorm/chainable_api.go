@@ -54,9 +54,12 @@ func (db *DB) Table(name string, args ...interface{}) (tx *DB) {
 	} else if tables := strings.Split(name, "."); len(tables) == 2 {
 		tx.Statement.TableExpr = &clause.Expr{SQL: tx.Statement.Quote(name)}
 		tx.Statement.Table = tables[1]
-	} else {
+	} else if name != "" {
 		tx.Statement.TableExpr = &clause.Expr{SQL: tx.Statement.Quote(name)}
 		tx.Statement.Table = name
+	} else {
+		tx.Statement.TableExpr = nil
+		tx.Statement.Table = ""
 	}
 	return
 }
@@ -175,12 +178,12 @@ func (db *DB) Or(query interface{}, args ...interface{}) (tx *DB) {
 func (db *DB) Joins(query string, args ...interface{}) (tx *DB) {
 	tx = db.getInstance()
 
-	if len(args) > 0 {
+	if len(args) == 1 {
 		if db, ok := args[0].(*DB); ok {
 			if where, ok := db.Statement.Clauses["WHERE"].Expression.(clause.Where); ok {
-				tx.Statement.Joins = append(tx.Statement.Joins, join{Name: query, Conds: args[1:], On: &where})
+				tx.Statement.Joins = append(tx.Statement.Joins, join{Name: query, Conds: args, On: &where})
+				return
 			}
-			return
 		}
 	}
 

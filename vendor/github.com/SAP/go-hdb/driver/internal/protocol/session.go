@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2014-2021 SAP SE
+// SPDX-FileCopyrightText: 2014-2022 SAP SE
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -853,7 +853,9 @@ func (s *Session) encodeLobs(cr *callResult, ids []locatorID, inPrmFields []*Par
 
 		// TODO check total size limit
 		for _, descr := range descrs {
-			descr.fetchNext(chunkSize)
+			if err := descr.fetchNext(chunkSize); err != nil {
+				return err
+			}
 		}
 
 		writeLobRequest.descrs = descrs

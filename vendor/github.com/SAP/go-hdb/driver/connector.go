@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2014-2021 SAP SE
+// SPDX-FileCopyrightText: 2014-2022 SAP SE
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"reflect"
 	"strconv"
 	"sync"
@@ -325,7 +326,7 @@ func (c *Connector) setDSN(dsn string) error {
 
 		case DSNTLSRootCAFile:
 			for _, fn := range v {
-				rootPEM, err := _readFile(fn)
+				rootPEM, err := os.ReadFile(fn)
 				if err != nil {
 					return err
 				}

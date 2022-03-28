@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2014-2021 SAP SE
+// SPDX-FileCopyrightText: 2014-2022 SAP SE
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -97,10 +97,11 @@ func RuneLen(r rune) int {
 // - see (*) for code changes
 
 // Code points in the surrogate range are not valid for UTF-8.
-const (
-	surrogateMin = 0xD800
-	surrogateMax = 0xDFFF
-)
+// (*) const not needed
+// const (
+// 	surrogateMin = 0xD800
+// 	surrogateMax = 0xDFFF
+// )
 
 const (
 	t1 = 0x00 // 0000 0000

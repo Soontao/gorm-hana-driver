@@ -219,7 +219,7 @@ func (m Migrator) ColumnTypes(value interface{}) ([]gorm.ColumnType, error) {
 	columnTypes := make([]gorm.ColumnType, 0)
 	err := m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		currentDatabase := m.DB.Migrator().CurrentDatabase()
-		columnTypeSQL := "SELECT column_name, is_nullable, data_type_name, length, scale FROM SYS.TABLE_COLUMNS WHERE schema_name = ? AND table_name = ? ORDER BY POSITION ASC"
+		columnTypeSQL := "SELECT column_name, is_nullable, data_type_name, length, scale, DEFAULT_VALUE, COMMENTS FROM SYS.TABLE_COLUMNS WHERE schema_name = ? AND table_name = ? ORDER BY POSITION ASC"
 
 		columns, rowErr := m.DB.Raw(columnTypeSQL, currentDatabase, stmt.Table).Rows()
 		if rowErr != nil {
@@ -229,14 +229,17 @@ func (m Migrator) ColumnTypes(value interface{}) ([]gorm.ColumnType, error) {
 		defer columns.Close()
 
 		for columns.Next() {
-			var column Column
+			var column = migrator.ColumnType{}
 
+			// TODO: PK and UNIQUE key
 			var values = []interface{}{
-				&column.name,
-				&column.nullable,
-				&column.datatype,
-				&column.length,
-				&column.scale,
+				&column.NameValue,
+				&column.NullableValue,
+				&column.DataTypeValue,
+				&column.LengthValue,
+				&column.ScaleValue,
+				&column.DefaultValueValue,
+				&column.CommentValue,
 			}
 
 			if scanErr := columns.Scan(values...); scanErr != nil {
