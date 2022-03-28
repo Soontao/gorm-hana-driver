@@ -35,3 +35,6 @@ main/output
 ast/**/output.json
 debug
 coverage.txt
+
+# local
+.env

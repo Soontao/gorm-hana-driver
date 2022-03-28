@@ -4,6 +4,6 @@
 
 ## Usage
 
-TBD
+- [DSN Format](https://github.com/SAP/go-hdb#hana-cloud-connection)
 
 ## [LICENSE](./LICENSE)
