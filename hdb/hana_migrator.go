@@ -62,7 +62,7 @@ func (m Migrator) HasTable(value interface{}) bool {
 
 	m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		currentDatabase := m.DB.Migrator().CurrentDatabase()
-		return m.DB.Raw("SELECT count(*) FROM sys.tables WHERE schema_name = ? AND table_name = ?", currentDatabase, stmt.Table).Row().Scan(&count)
+		return m.DB.Raw("SELECT count(1) FROM sys.tables WHERE schema_name = ? AND table_name = ?", currentDatabase, stmt.Table).Row().Scan(&count)
 	})
 
 	return count > 0
@@ -89,42 +89,6 @@ func (m Migrator) HasColumn(value interface{}, field string) bool {
 func (m Migrator) CurrentDatabase() (name string) {
 	m.DB.Raw("SELECT CURRENT_SCHEMA FROM DUMMY").Row().Scan(&name)
 	return
-}
-
-func (m Migrator) MigrateColumn(value interface{}, field *schema.Field, columnType gorm.ColumnType) error {
-
-	alterColumn := false
-
-	// check precision
-	if precision, scale, ok := columnType.DecimalSize(); ok && field.Precision > 0 {
-		if precision > 0 && precision != int64(field.Precision) {
-			alterColumn = true
-		}
-		if scale > 0 && scale != int64(field.Scale) {
-			alterColumn = true
-		}
-	}
-
-	// for string or blob ?
-	if length, ok := columnType.Length(); ok && length > 0 && field.Size > 0 {
-		if length != int64(field.Size) {
-			alterColumn = true
-		}
-	}
-
-	// check nullable
-	if nullable, ok := columnType.Nullable(); ok && nullable == field.NotNull {
-		// not primary key & database is nullable
-		if !field.PrimaryKey && nullable {
-			alterColumn = true
-		}
-	}
-
-	if alterColumn && !field.IgnoreMigration {
-		return m.DB.Migrator().AlterColumn(value, field.Name)
-	}
-
-	return nil
 }
 
 func (m Migrator) RenameColumn(value interface{}, oldName, newName string) error {
@@ -219,7 +183,27 @@ func (m Migrator) ColumnTypes(value interface{}) ([]gorm.ColumnType, error) {
 	columnTypes := make([]gorm.ColumnType, 0)
 	err := m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		currentDatabase := m.DB.Migrator().CurrentDatabase()
-		columnTypeSQL := "SELECT column_name, is_nullable, data_type_name, length, scale, DEFAULT_VALUE, COMMENTS FROM SYS.TABLE_COLUMNS WHERE schema_name = ? AND table_name = ? ORDER BY POSITION ASC"
+		columnTypeSQL := `SELECT
+		t.column_name,
+		t.is_nullable,
+		t.data_type_name,
+		t.length,
+		t.scale,
+		t.DEFAULT_VALUE,
+		t.COMMENTS,
+		c.is_primary_key,
+		c.is_unique_key
+	FROM
+		SYS.TABLE_COLUMNS t
+	LEFT JOIN SYS.CONSTRAINTS c ON
+		c.SCHEMA_NAME = t.SCHEMA_NAME
+		AND c.TABLE_NAME = t.TABLE_NAME
+		AND c.COLUMN_NAME = t.COLUMN_NAME
+	WHERE
+		t.schema_name = ?
+		AND t.table_name = ?
+	ORDER BY
+		t.POSITION ASC`
 
 		columns, rowErr := m.DB.Raw(columnTypeSQL, currentDatabase, stmt.Table).Rows()
 		if rowErr != nil {
@@ -231,7 +215,6 @@ func (m Migrator) ColumnTypes(value interface{}) ([]gorm.ColumnType, error) {
 		for columns.Next() {
 			var column = migrator.ColumnType{}
 
-			// TODO: PK and UNIQUE key
 			var values = []interface{}{
 				&column.NameValue,
 				&column.NullableValue,
@@ -240,11 +223,15 @@ func (m Migrator) ColumnTypes(value interface{}) ([]gorm.ColumnType, error) {
 				&column.ScaleValue,
 				&column.DefaultValueValue,
 				&column.CommentValue,
+				&column.PrimaryKeyValue,
+				&column.UniqueValue,
 			}
 
 			if scanErr := columns.Scan(values...); scanErr != nil {
 				return scanErr
 			}
+
+			column.DecimalSizeValue = column.LengthValue
 
 			columnTypes = append(columnTypes, column)
 		}
