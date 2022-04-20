@@ -1,4 +1,4 @@
-# github.com/SAP/go-hdb v0.105.8
+# github.com/SAP/go-hdb v0.106.1
 ## explicit
 github.com/SAP/go-hdb/driver
 github.com/SAP/go-hdb/driver/dial
