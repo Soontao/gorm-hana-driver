@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jinzhu/now"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/utils"
 )
 
@@ -260,8 +261,8 @@ func (schema *Schema) ParseField(fieldStruct reflect.StructField) *Field {
 			field.DataType = Time
 		}
 		if field.HasDefaultValue && !skipParseDefaultValue && field.DataType == Time {
-			if field.DefaultValueInterface, err = now.Parse(field.DefaultValue); err != nil {
-				schema.err = fmt.Errorf("failed to parse default value `%v` for field %v", field.DefaultValue, field.Name)
+			if t, err := now.Parse(field.DefaultValue); err == nil {
+				field.DefaultValueInterface = t
 			}
 		}
 	case reflect.Array, reflect.Slice:
@@ -274,7 +275,7 @@ func (schema *Schema) ParseField(fieldStruct reflect.StructField) *Field {
 		field.DataType = DataType(dataTyper.GormDataType())
 	}
 
-	if v, ok := field.TagSettings["AUTOCREATETIME"]; ok || (field.Name == "CreatedAt" && (field.DataType == Time || field.DataType == Int || field.DataType == Uint)) {
+	if v, ok := field.TagSettings["AUTOCREATETIME"]; (ok && utils.CheckTruth(v)) || (!ok && field.Name == "CreatedAt" && (field.DataType == Time || field.DataType == Int || field.DataType == Uint)) {
 		if field.DataType == Time {
 			field.AutoCreateTime = UnixTime
 		} else if strings.ToUpper(v) == "NANO" {
@@ -286,7 +287,7 @@ func (schema *Schema) ParseField(fieldStruct reflect.StructField) *Field {
 		}
 	}
 
-	if v, ok := field.TagSettings["AUTOUPDATETIME"]; ok || (field.Name == "UpdatedAt" && (field.DataType == Time || field.DataType == Int || field.DataType == Uint)) {
+	if v, ok := field.TagSettings["AUTOUPDATETIME"]; (ok && utils.CheckTruth(v)) || (!ok && field.Name == "UpdatedAt" && (field.DataType == Time || field.DataType == Int || field.DataType == Uint)) {
 		if field.DataType == Time {
 			field.AutoUpdateTime = UnixTime
 		} else if strings.ToUpper(v) == "NANO" {
@@ -527,6 +528,9 @@ func (field *Field) setupValuerAndSetter() {
 			reflectValType := reflectV.Type()
 
 			if reflectValType.AssignableTo(field.FieldType) {
+				if reflectV.Kind() == reflect.Ptr && reflectV.Elem().Kind() == reflect.Ptr {
+					reflectV = reflect.Indirect(reflectV)
+				}
 				field.ReflectValueOf(ctx, value).Set(reflectV)
 				return
 			} else if reflectValType.ConvertibleTo(field.FieldType) {
@@ -567,8 +571,8 @@ func (field *Field) setupValuerAndSetter() {
 				if v, err = valuer.Value(); err == nil {
 					err = setter(ctx, value, v)
 				}
-			} else {
-				return fmt.Errorf("failed to set value %+v to field %s", v, field.Name)
+			} else if _, ok := v.(clause.Expr); !ok {
+				return fmt.Errorf("failed to set value %#v to field %s", v, field.Name)
 			}
 		}
 
@@ -931,7 +935,6 @@ func (field *Field) setupValuerAndSetter() {
 }
 
 func (field *Field) setupNewValuePool() {
-	var fieldValue = reflect.New(field.FieldType).Interface()
 	if field.Serializer != nil {
 		field.NewValuePool = &sync.Pool{
 			New: func() interface{} {
@@ -941,31 +944,9 @@ func (field *Field) setupNewValuePool() {
 				}
 			},
 		}
-	} else if _, ok := fieldValue.(sql.Scanner); !ok {
-		field.setupDefaultNewValuePool()
 	}
 
 	if field.NewValuePool == nil {
 		field.NewValuePool = poolInitializer(reflect.PtrTo(field.IndirectFieldType))
-	}
-}
-
-func (field *Field) setupDefaultNewValuePool() {
-	// set default NewValuePool
-	switch field.IndirectFieldType.Kind() {
-	case reflect.String:
-		field.NewValuePool = stringPool
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		field.NewValuePool = intPool
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		field.NewValuePool = uintPool
-	case reflect.Float32, reflect.Float64:
-		field.NewValuePool = floatPool
-	case reflect.Bool:
-		field.NewValuePool = boolPool
-	default:
-		if field.IndirectFieldType == TimeReflectType {
-			field.NewValuePool = timePool
-		}
 	}
 }
