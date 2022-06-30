@@ -10,7 +10,7 @@ github.com/SAP/go-hdb/driver/internal/protocol/scanner
 github.com/SAP/go-hdb/driver/internal/rand
 github.com/SAP/go-hdb/driver/sqltrace
 github.com/SAP/go-hdb/driver/unicode/cesu8
-# github.com/davecgh/go-spew v1.1.0
+# github.com/davecgh/go-spew v1.1.1
 github.com/davecgh/go-spew/spew
 # github.com/google/uuid v1.3.0
 ## explicit
@@ -22,7 +22,7 @@ github.com/jinzhu/inflection
 github.com/jinzhu/now
 # github.com/pmezard/go-difflib v1.0.0
 github.com/pmezard/go-difflib/difflib
-# github.com/stretchr/testify v1.7.0
+# github.com/stretchr/testify v1.8.0
 ## explicit
 github.com/stretchr/testify/assert
 # golang.org/x/crypto v0.0.0-20220321153916-2c7772ba3064
@@ -30,7 +30,7 @@ github.com/stretchr/testify/assert
 golang.org/x/crypto/pbkdf2
 # golang.org/x/text v0.3.7
 golang.org/x/text/transform
-# gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c
+# gopkg.in/yaml.v3 v3.0.1
 gopkg.in/yaml.v3
 # gorm.io/gorm v1.23.3
 ## explicit
