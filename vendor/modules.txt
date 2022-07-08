@@ -32,7 +32,7 @@ golang.org/x/crypto/pbkdf2
 golang.org/x/text/transform
 # gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c
 gopkg.in/yaml.v3
-# gorm.io/gorm v1.23.3
+# gorm.io/gorm v1.23.8
 ## explicit
 gorm.io/gorm
 gorm.io/gorm/callbacks
