@@ -17,6 +17,16 @@ import (
 	"github.com/SAP/go-hdb/driver/unicode/cesu8"
 )
 
+// DriverVersion holds the version of the driver and is set during go-hdb initialization to driver.DriverVersion value.
+var DriverVersion string
+
+// ClientID holds the client ID of the driver's process and is set during go-hdb initialization to driver.clientID value.
+var ClientID string
+
+// clientType is the information provided to HDB identifying the driver.
+// Previously the driver.DriverName "hdb" was used but we should be more specific in providing a unique client type to HANA backend.
+const clientType = "go-hdb"
+
 //padding
 const padding = 8
 
@@ -28,13 +38,12 @@ func padBytes(size int) int {
 }
 
 const (
-	dfvLevel1        = 1
 	defaultSessionID = -1
 )
 
 // Session represents a HDB session.
 type Session struct {
-	cfg *SessionConfig
+	attrs *SessionAttrs // as a dedicated instance (clone) is used for every session we can access the attributes directly.
 
 	sessionID     int64
 	serverOptions connectOptions
@@ -45,22 +54,21 @@ type Session struct {
 }
 
 // NewSession creates a new database session.
-func NewSession(ctx context.Context, rw *bufio.ReadWriter, cfg *SessionConfig) (*Session, error) {
-	pw := newProtocolWriter(rw.Writer, cfg.CESU8Encoder, cfg.SessionVariables) // write upstream
+func NewSession(ctx context.Context, rw *bufio.ReadWriter, attrs *SessionAttrs, auth *Auth) (*Session, error) {
+	pw := newProtocolWriter(rw.Writer, attrs.cesu8Encoder, attrs.sessionVariables) // write upstream
 	if err := pw.writeProlog(); err != nil {
 		return nil, err
 	}
 
-	pr := newProtocolReader(false, rw.Reader, cfg.CESU8Decoder) // read downstream
+	pr := newProtocolReader(false, rw.Reader, attrs.cesu8Decoder) // read downstream
 	if err := pr.readProlog(); err != nil {
 		return nil, err
 	}
 
-	s := &Session{cfg: cfg, sessionID: defaultSessionID, pr: pr, pw: pw}
+	s := &Session{attrs: attrs, sessionID: defaultSessionID, pr: pr, pw: pw}
 
-	authStepper := newAuth(cfg.Username, cfg.Password)
 	var err error
-	if s.sessionID, s.serverOptions, err = s.authenticate(authStepper); err != nil {
+	if s.sessionID, s.serverOptions, err = s.authenticate(auth); err != nil {
 		return nil, err
 	}
 
@@ -88,62 +96,62 @@ func (s *Session) defaultClientOptions() connectOptions {
 		int8(coDistributionProtocolVersion): optBooleanType(false),
 		int8(coSelectForUpdateSupported):    optBooleanType(false),
 		int8(coSplitBatchCommands):          optBooleanType(true),
-		int8(coDataFormatVersion2):          optIntType(s.cfg.Dfv),
+		int8(coDataFormatVersion2):          optIntType(s.attrs.dfv),
 		int8(coCompleteArrayExecution):      optBooleanType(true),
 		int8(coClientDistributionMode):      cdmOff,
 		// int8(coImplicitLobStreaming):        optBooleanType(true),
 	}
-	if s.cfg.Locale != "" {
-		co[int8(coClientLocale)] = optStringType(s.cfg.Locale)
+	if s.attrs.locale != "" {
+		co[int8(coClientLocale)] = optStringType(s.attrs.locale)
 	}
 	return co
 }
 
-func (s *Session) authenticate(stepper authStepper) (int64, connectOptions, error) {
-	var auth partReadWriter
-	var err error
+func (s *Session) authenticate(auth *Auth) (int64, connectOptions, error) {
 
 	// client context
 	clientContext := clientContext(plainOptions{
-		int8(ccoClientVersion):            optStringType(s.cfg.DriverVersion),
-		int8(ccoClientType):               optStringType(s.cfg.DriverName),
-		int8(ccoClientApplicationProgram): optStringType(s.cfg.ApplicationName),
+		int8(ccoClientVersion):            optStringType(DriverVersion),
+		int8(ccoClientType):               optStringType(clientType),
+		int8(ccoClientApplicationProgram): optStringType(s.attrs.applicationName),
 	})
 
-	if auth, err = stepper.next(); err != nil {
+	var part partReadWriter
+	var err error
+
+	if part, err = auth.step0(); err != nil {
 		return 0, nil, err
 	}
-	if err := s.pw.write(s.sessionID, mtAuthenticate, false, clientContext, auth); err != nil {
+	if err := s.pw.write(s.sessionID, mtAuthenticate, false, clientContext, part); err != nil {
 		return 0, nil, err
 	}
 
-	if auth, err = stepper.next(); err != nil {
+	if part, err = auth.step1(); err != nil {
 		return 0, nil, err
 	}
 	if err := s.pr.iterateParts(func(ph *partHeader) {
 		if ph.partKind == pkAuthentication {
-			s.pr.read(auth)
+			s.pr.read(part)
 		}
 	}); err != nil {
 		return 0, nil, err
 	}
 
-	if auth, err = stepper.next(); err != nil {
+	if part, err = auth.step2(); err != nil {
 		return 0, nil, err
 	}
-	id := newClientID()
 	co := s.defaultClientOptions()
-	if err := s.pw.write(s.sessionID, mtConnect, false, auth, id, co); err != nil {
+	if err := s.pw.write(s.sessionID, mtConnect, false, part, clientID(ClientID), co); err != nil {
 		return 0, nil, err
 	}
 
-	if auth, err = stepper.next(); err != nil {
+	if part, err = auth.step3(); err != nil {
 		return 0, nil, err
 	}
 	if err := s.pr.iterateParts(func(ph *partHeader) {
 		switch ph.partKind {
 		case pkAuthentication:
-			s.pr.read(auth)
+			s.pr.read(part)
 		case pkConnectOptions:
 			s.pr.read(&co)
 			// set data format version
@@ -151,9 +159,13 @@ func (s *Session) authenticate(stepper authStepper) (int64, connectOptions, erro
 			s.pr.setDfv(int(co[int8(coDataFormatVersion2)].(optIntType)))
 		}
 	}); err != nil {
+		if err, ok := err.(*hdbErrors); ok {
+			if err.Code() == hdbErrAuthenticationFailed {
+				return 0, nil, newAuthFailedError(auth.method.typ(), err)
+			}
+		}
 		return 0, nil, err
 	}
-
 	return s.pr.sessionID(), co, nil
 }
 
@@ -242,12 +254,12 @@ func (s *Session) Prepare(query string) (*PrepareResult, error) {
 }
 
 // fetchFirstLobChunk reads the first LOB data ckunk.
-func (s *Session) fetchFirstLobChunk(args []interface{}) (bool, error) {
-	chunkSize := s.cfg.LobChunkSize
+func (s *Session) fetchFirstLobChunk(nvargs []driver.NamedValue) (bool, error) {
+	chunkSize := s.attrs.lobChunkSize
 	hasNext := false
 
-	for _, arg := range args {
-		if lobInDescr, ok := arg.(*lobInDescr); ok {
+	for _, arg := range nvargs {
+		if lobInDescr, ok := arg.Value.(*lobInDescr); ok {
 			last, err := lobInDescr.fetchNext(chunkSize)
 			if !last {
 				hasNext = true
@@ -280,7 +292,7 @@ Bulk insert containing LOBs:
   Package invariant:
   - For all packages except the last one, the last row contains 'incomplete' LOB data ('piecewise' writing)
 */
-func (s *Session) Exec(pr *PrepareResult, args []interface{}, commit bool) (driver.Result, error) {
+func (s *Session) Exec(pr *PrepareResult, nvargs []driver.NamedValue, commit bool) (driver.Result, error) {
 	hasLob := func() bool {
 		for _, f := range pr.parameterFields {
 			if f.tc.isLob() {
@@ -291,13 +303,13 @@ func (s *Session) Exec(pr *PrepareResult, args []interface{}, commit bool) (driv
 	}()
 
 	// no split needed: no LOB or only one row
-	if !hasLob || len(pr.parameterFields) == len(args) {
-		return s.exec(pr, args, hasLob, commit)
+	if !hasLob || len(pr.parameterFields) == len(nvargs) {
+		return s.exec(pr, nvargs, hasLob, commit)
 	}
 
 	// args need to be potentially splitted (piecewise LOB handling)
 	numColumns := len(pr.parameterFields)
-	numRows := len(args) / numColumns
+	numRows := len(nvargs) / numColumns
 	totRowsAffected := int64(0)
 	lastFrom := 0
 
@@ -306,7 +318,7 @@ func (s *Session) Exec(pr *PrepareResult, args []interface{}, commit bool) (driv
 		from := i * numColumns
 		to := from + numColumns
 
-		hasNext, err := s.fetchFirstLobChunk(args[from:to])
+		hasNext, err := s.fetchFirstLobChunk(nvargs[from:to])
 		if err != nil {
 			return nil, err
 		}
@@ -316,7 +328,7 @@ func (s *Session) Exec(pr *PrepareResult, args []interface{}, commit bool) (driv
 			or we did reach the last row
 		*/
 		if hasNext || i == (numRows-1) {
-			r, err := s.exec(pr, args[lastFrom:to], true, commit)
+			r, err := s.exec(pr, nvargs[lastFrom:to], true, commit)
 			if err != nil {
 				return driver.RowsAffected(totRowsAffected), err
 			}
@@ -333,8 +345,8 @@ func (s *Session) Exec(pr *PrepareResult, args []interface{}, commit bool) (driv
 }
 
 // exec executes an exec server call.
-func (s *Session) exec(pr *PrepareResult, args []interface{}, hasLob, commit bool) (driver.Result, error) {
-	inputParameters, err := newInputParameters(pr.parameterFields, args, hasLob)
+func (s *Session) exec(pr *PrepareResult, nvargs []driver.NamedValue, hasLob, commit bool) (driver.Result, error) {
+	inputParameters, err := newInputParameters(pr.parameterFields, nvargs, hasLob)
 	if err != nil {
 		return nil, err
 	}
@@ -367,7 +379,7 @@ func (s *Session) exec(pr *PrepareResult, args []interface{}, hasLob, commit boo
 			- chunkReaders
 			- nil (no callResult, exec does not have output parameters)
 		*/
-		if err := s.encodeLobs(nil, ids, pr.parameterFields, args); err != nil {
+		if err := s.encodeLobs(nil, ids, pr.parameterFields, nvargs); err != nil {
 			return nil, err
 		}
 	}
@@ -379,7 +391,7 @@ func (s *Session) exec(pr *PrepareResult, args []interface{}, hasLob, commit boo
 }
 
 // QueryCall executes a stored procecure (by Query).
-func (s *Session) QueryCall(pr *PrepareResult, args []interface{}) (driver.Rows, error) {
+func (s *Session) QueryCall(pr *PrepareResult, nvargs []driver.NamedValue) (driver.Rows, error) {
 	/*
 		only in args
 		invariant: #inPrmFields == #args
@@ -399,11 +411,11 @@ func (s *Session) QueryCall(pr *PrepareResult, args []interface{}) (driver.Rows,
 	}
 
 	if hasInLob {
-		if _, err := s.fetchFirstLobChunk(args); err != nil {
+		if _, err := s.fetchFirstLobChunk(nvargs); err != nil {
 			return nil, err
 		}
 	}
-	inputParameters, err := newInputParameters(inPrmFields, args, hasInLob)
+	inputParameters, err := newInputParameters(inPrmFields, nvargs, hasInLob)
 	if err != nil {
 		return nil, err
 	}
@@ -429,13 +441,13 @@ func (s *Session) QueryCall(pr *PrepareResult, args []interface{}) (driver.Rows,
 			- chunkReaders
 			- cr (callResult output parameters are set after all lob input parameters are written)
 		*/
-		if err := s.encodeLobs(cr, ids, inPrmFields, args); err != nil {
+		if err := s.encodeLobs(cr, ids, inPrmFields, nvargs); err != nil {
 			return nil, err
 		}
 	}
 
 	// legacy mode?
-	if s.cfg.Legacy {
+	if s.attrs.legacy {
 		cr.appendTableRefFields() // TODO review
 		for _, qr := range cr.qrs {
 			// add to cache
@@ -448,25 +460,25 @@ func (s *Session) QueryCall(pr *PrepareResult, args []interface{}) (driver.Rows,
 }
 
 // ExecCall executes a stored procecure (by Exec).
-func (s *Session) ExecCall(pr *PrepareResult, args []interface{}) (driver.Result, error) {
+func (s *Session) ExecCall(pr *PrepareResult, nvargs []driver.NamedValue) (driver.Result, error) {
 	/*
 		in,- and output args
 		invariant: #prmFields == #args
 	*/
 	var inPrmFields, outPrmFields []*ParameterField
-	var inArgs, outArgs []interface{}
+	var inArgs, outArgs []driver.NamedValue
 	hasInLob := false
 	for i, f := range pr.parameterFields {
 		if f.In() {
 			inPrmFields = append(inPrmFields, f)
-			inArgs = append(inArgs, args[i])
+			inArgs = append(inArgs, nvargs[i])
 			if f.tc.isLob() {
 				hasInLob = true
 			}
 		}
 		if f.Out() {
 			outPrmFields = append(outPrmFields, f)
-			outArgs = append(outArgs, args[i])
+			outArgs = append(outArgs, nvargs[i])
 		}
 	}
 
@@ -567,7 +579,7 @@ func (s *Session) readCall(outputFields []*ParameterField) (*callResult, []locat
 }
 
 // Query executes a query.
-func (s *Session) Query(pr *PrepareResult, args []interface{}, commit bool) (driver.Rows, error) {
+func (s *Session) Query(pr *PrepareResult, nvargs []driver.NamedValue, commit bool) (driver.Rows, error) {
 	// allow e.g inserts as query -> handle commit like in exec
 
 	hasLob := func() bool {
@@ -580,11 +592,11 @@ func (s *Session) Query(pr *PrepareResult, args []interface{}, commit bool) (dri
 	}()
 
 	if hasLob {
-		if _, err := s.fetchFirstLobChunk(args); err != nil {
+		if _, err := s.fetchFirstLobChunk(nvargs); err != nil {
 			return nil, err
 		}
 	}
-	inputParameters, err := newInputParameters(pr.parameterFields, args, hasLob)
+	inputParameters, err := newInputParameters(pr.parameterFields, nvargs, hasLob)
 	if err != nil {
 		return nil, err
 	}
@@ -617,7 +629,7 @@ func (s *Session) Query(pr *PrepareResult, args []interface{}, commit bool) (dri
 
 // FetchNext fetches next chunk in query result set.
 func (s *Session) fetchNext(qr *queryResult) error {
-	if err := s.pw.write(s.sessionID, mtFetchNext, false, resultsetID(qr.rsID), fetchsize(s.cfg.FetchSize)); err != nil {
+	if err := s.pw.write(s.sessionID, mtFetchNext, false, resultsetID(qr.rsID), fetchsize(s.attrs.fetchSize)); err != nil {
 		return err
 	}
 
@@ -721,7 +733,7 @@ func (s *Session) decodeLobs(descr *lobOutDescr, wr io.Writer) error {
 	var err error
 
 	if descr.isCharBased {
-		wrcl := transform.NewWriter(wr, s.cfg.CESU8Decoder()) // CESU8 transformer
+		wrcl := transform.NewWriter(wr, s.attrs.cesu8Decoder()) // CESU8 transformer
 		err = s._decodeLobs(descr, wrcl, func(b []byte) (int64, error) {
 			// Caution: hdb counts 4 byte utf-8 encodings (cesu-8 6 bytes) as 2 (3 byte) chars
 			numChars := int64(0)
@@ -753,7 +765,7 @@ func (s *Session) decodeLobs(descr *lobOutDescr, wr io.Writer) error {
 }
 
 func (s *Session) _decodeLobs(descr *lobOutDescr, wr io.Writer, countChars func(b []byte) (int64, error)) error {
-	lobChunkSize := int64(s.cfg.LobChunkSize)
+	lobChunkSize := int64(s.attrs.lobChunkSize)
 
 	chunkSize := func(numChar, ofs int64) int32 {
 		chunkSize := numChar - ofs
@@ -814,19 +826,19 @@ func (s *Session) _decodeLobs(descr *lobOutDescr, wr io.Writer, countChars func(
 }
 
 // encodeLobs encodes (write to db) input lob parameters.
-func (s *Session) encodeLobs(cr *callResult, ids []locatorID, inPrmFields []*ParameterField, args []interface{}) error {
+func (s *Session) encodeLobs(cr *callResult, ids []locatorID, inPrmFields []*ParameterField, nvargs []driver.NamedValue) error {
 
-	chunkSize := s.cfg.LobChunkSize
+	chunkSize := s.attrs.lobChunkSize
 
 	descrs := make([]*writeLobDescr, 0, len(ids))
 
 	numInPrmField := len(inPrmFields)
 
 	j := 0
-	for i, arg := range args { // range over args (mass / bulk operation)
+	for i, arg := range nvargs { // range over args (mass / bulk operation)
 		f := inPrmFields[i%numInPrmField]
 		if f.tc.isLob() {
-			lobInDescr, ok := arg.(*lobInDescr)
+			lobInDescr, ok := arg.Value.(*lobInDescr)
 			if !ok {
 				return fmt.Errorf("protocol error: invalid lob parameter %[1]T %[1]v - *lobInDescr expected", arg)
 			}

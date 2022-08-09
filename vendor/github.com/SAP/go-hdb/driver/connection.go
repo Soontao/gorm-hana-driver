@@ -91,23 +91,21 @@ const (
 	maxNumTraceArg = 20
 )
 
-func init() {
-	p.RegisterScanType(p.DtDecimal, reflect.TypeOf((*Decimal)(nil)).Elem())
-	p.RegisterScanType(p.DtLob, reflect.TypeOf((*Lob)(nil)).Elem())
-}
+var (
+	// register as var to execute even before init() funcs are called
+	_ = p.RegisterScanType(p.DtDecimal, reflect.TypeOf((*Decimal)(nil)).Elem())
+	_ = p.RegisterScanType(p.DtLob, reflect.TypeOf((*Lob)(nil)).Elem())
+)
 
 // dbConn wraps the database tcp connection. It sets timeouts and handles driver ErrBadConn behavior.
 type dbConn struct {
 	// atomic access - alignment
-	canceled  int32
+	cancelled int32
+	metrics   *metrics
 	conn      net.Conn
 	timeout   time.Duration
 	lastError error // error bad connection
 	closed    bool
-}
-
-func (c *dbConn) isBad() bool {
-	return c.lastError != nil
 }
 
 func (c *dbConn) deadline() (deadline time.Time) {
@@ -123,7 +121,7 @@ var (
 )
 
 func (c *dbConn) cancel() {
-	atomic.StoreInt32(&c.canceled, 1)
+	atomic.StoreInt32(&c.cancelled, 1)
 	c.lastError = errCancelled
 }
 
@@ -136,17 +134,18 @@ func (c *dbConn) close() error {
 // Read implements the io.Reader interface.
 func (c *dbConn) Read(b []byte) (n int, err error) {
 	// check if killed
-	if atomic.LoadInt32(&c.canceled) == 1 {
+	if atomic.LoadInt32(&c.cancelled) == 1 {
 		return 0, driver.ErrBadConn
 	}
 	//set timeout
 	if err = c.conn.SetReadDeadline(c.deadline()); err != nil {
 		goto retError
 	}
-	if n, err = c.conn.Read(b); err != nil {
-		goto retError
+	n, err = c.conn.Read(b)
+	c.metrics.addCounterValue(counterBytesRead, uint64(n))
+	if err == nil {
+		return
 	}
-	return
 retError:
 	dlog.Printf("Connection read error local address %s remote address %s: %s", c.conn.LocalAddr(), c.conn.RemoteAddr(), err)
 	c.lastError = err
@@ -156,17 +155,18 @@ retError:
 // Write implements the io.Writer interface.
 func (c *dbConn) Write(b []byte) (n int, err error) {
 	// check if killed
-	if atomic.LoadInt32(&c.canceled) == 1 {
+	if atomic.LoadInt32(&c.cancelled) == 1 {
 		return 0, driver.ErrBadConn
 	}
 	//set timeout
 	if err = c.conn.SetWriteDeadline(c.deadline()); err != nil {
 		goto retError
 	}
-	if n, err = c.conn.Write(b); err != nil {
-		goto retError
+	n, err = c.conn.Write(b)
+	c.metrics.addCounterValue(counterBytesWritten, uint64(n))
+	if err == nil {
+		return
 	}
-	return
 retError:
 	dlog.Printf("Connection write error local address %s remote address %s: %s", c.conn.LocalAddr(), c.conn.RemoteAddr(), err)
 	c.lastError = err
@@ -204,7 +204,7 @@ func (l *connLock) unlock() {
 	l.connMu.Unlock()
 }
 
-//  check if conn implements all required interfaces
+// check if conn implements all required interfaces
 var (
 	_ driver.Conn               = (*conn)(nil)
 	_ driver.ConnPrepareContext = (*conn)(nil)
@@ -236,6 +236,7 @@ type Conn interface {
 
 // Conn is the implementation of the database/sql/driver Conn interface.
 type conn struct {
+	metrics *metrics
 	// Holding connection lock in QueryResultSet (see rows.onClose)
 	/*
 		As long as a session is in query mode no other sql statement must be executed.
@@ -248,69 +249,72 @@ type conn struct {
 	*/
 	connLock
 
-	ctr     *Connector
-	dbConn  *dbConn
-	session *p.Session
-	scanner *scanner.Scanner
-	closed  chan struct{}
+	dbConn   *dbConn
+	session  *p.Session
+	scanner  *scanner.Scanner
+	closed   chan struct{}
+	bulkSize int
 
 	inTx bool // in transaction
+
+	lastError error // last error
+
+	trace bool // call sqlTrace.On() only once
 }
 
-func newConn(ctx context.Context, ctr *Connector) (driver.Conn, error) {
+func newConn(ctx context.Context, metrics *metrics, connAttrs *connAttrs, sessionAttrs *p.SessionAttrs, auth *p.Auth) (driver.Conn, error) {
+	// connAttrs needs to be read locked by caller
 
-	ctr.mu.RLock() // lock connector
-	defer ctr.mu.RUnlock()
-
-	netConn, err := ctr.dialer.DialContext(ctx, ctr.host, dial.DialerOptions{Timeout: ctr.timeout, TCPKeepAlive: ctr.tcpKeepAlive})
+	netConn, err := connAttrs._dialer.DialContext(ctx, connAttrs._host, dial.DialerOptions{Timeout: connAttrs._timeout, TCPKeepAlive: connAttrs._tcpKeepAlive})
 	if err != nil {
 		return nil, err
 	}
 
 	// is TLS connection requested?
-	if ctr.tlsConfig != nil {
-		netConn = tls.Client(netConn, ctr.tlsConfig)
+	if connAttrs._tlsConfig != nil {
+		netConn = tls.Client(netConn, connAttrs._tlsConfig)
 	}
 
-	dbConn := &dbConn{conn: netConn, timeout: ctr.timeout}
+	dbConn := &dbConn{metrics: metrics, conn: netConn, timeout: connAttrs._timeout}
 	// buffer connection
-	rw := bufio.NewReadWriter(bufio.NewReaderSize(dbConn, ctr.bufferSize), bufio.NewWriterSize(dbConn, ctr.bufferSize))
+	rw := bufio.NewReadWriter(bufio.NewReaderSize(dbConn, connAttrs._bufferSize), bufio.NewWriterSize(dbConn, connAttrs._bufferSize))
 
-	session, err := p.NewSession(ctx, rw,
-		&p.SessionConfig{
-			DriverVersion:    DriverVersion,
-			DriverName:       DriverName,
-			ApplicationName:  ctr.applicationName,
-			Username:         ctr.username,
-			Password:         ctr.password,
-			SessionVariables: ctr.sessionVariables,
-			Locale:           ctr.locale,
-			FetchSize:        ctr.fetchSize,
-			LobChunkSize:     ctr.lobChunkSize,
-			Dfv:              ctr.dfv,
-			Legacy:           ctr.legacy,
-			CESU8Decoder:     ctr.cesu8Decoder,
-			CESU8Encoder:     ctr.cesu8Encoder,
-		},
-	)
+	session, err := p.NewSession(ctx, rw, sessionAttrs, auth)
 	if err != nil {
 		return nil, err
 	}
 
-	c := &conn{ctr: ctr, dbConn: dbConn, session: session, scanner: &scanner.Scanner{}, closed: make(chan struct{})}
-	if ctr.defaultSchema != "" {
-		if _, err := c.ExecContext(ctx, fmt.Sprintf(setDefaultSchema, Identifier(ctr.defaultSchema)), nil); err != nil {
+	c := &conn{metrics: metrics, dbConn: dbConn, session: session, scanner: &scanner.Scanner{}, closed: make(chan struct{}), bulkSize: connAttrs._bulkSize, trace: sqltrace.On()}
+
+	if connAttrs._defaultSchema != "" {
+		if _, err := c.ExecContext(ctx, fmt.Sprintf(setDefaultSchema, Identifier(connAttrs._defaultSchema)), nil); err != nil {
 			return nil, err
 		}
 	}
 
-	if ctr.pingInterval != 0 {
-		go c.pinger(ctr.pingInterval, c.closed)
+	if connAttrs._pingInterval != 0 {
+		go c.pinger(connAttrs._pingInterval, c.closed)
 	}
 
-	hdbDriver.addConn(1) // increment open connections.
+	c.metrics.addGaugeValue(gaugeConn, 1) // increment open connections.
 
 	return c, nil
+}
+
+func (c *conn) isBad() bool {
+	switch {
+
+	case c.dbConn.lastError != nil:
+		return true
+
+	case c.lastError != nil:
+		// if last error was not a hdb error the connection is most probably not useable any more, e.g.
+		// interrupted read / write on connection.
+		if _, ok := c.lastError.(Error); !ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *conn) pinger(d time.Duration, done <-chan struct{}) {
@@ -335,13 +339,17 @@ func (c *conn) Ping(ctx context.Context) (err error) {
 	}
 	defer c.unlock()
 
-	if c.dbConn.isBad() {
+	if c.isBad() {
 		return driver.ErrBadConn
 	}
 
 	done := make(chan struct{})
 	go func() {
-		_, err = c.session.QueryDirect(dummyQuery, !c.inTx)
+		c.execSQL(sqlPing, dummyQuery, nil,
+			func() {
+				_, err = c.session.QueryDirect(dummyQuery, !c.inTx)
+			},
+		)
 		close(done)
 	}()
 
@@ -350,6 +358,7 @@ func (c *conn) Ping(ctx context.Context) (err error) {
 		c.dbConn.cancel()
 		return ctx.Err()
 	case <-done:
+		c.lastError = err
 		return err
 	}
 }
@@ -361,7 +370,7 @@ func (c *conn) ResetSession(ctx context.Context) error {
 
 	p.QueryResultCache.Cleanup(c.session)
 
-	if c.dbConn.isBad() {
+	if c.isBad() {
 		return driver.ErrBadConn
 	}
 	return nil
@@ -372,7 +381,7 @@ func (c *conn) IsValid() bool {
 	c.lock()
 	defer c.unlock()
 
-	return !c.dbConn.isBad()
+	return !c.isBad()
 }
 
 // PrepareContext implements the driver.ConnPrepareContext interface.
@@ -382,7 +391,7 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (stmt driver.St
 	}
 	defer c.unlock()
 
-	if c.dbConn.isBad() {
+	if c.isBad() {
 		return nil, driver.ErrBadConn
 	}
 
@@ -397,7 +406,11 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (stmt driver.St
 		if err != nil {
 			goto done
 		}
-		pr, err = c.session.Prepare(qd.Query())
+		c.execSQL(sqlPrepare, qd.Query(), nil,
+			func() {
+				pr, err = c.session.Prepare(qd.Query())
+			},
+		)
 		if err != nil {
 			goto done
 		}
@@ -415,7 +428,7 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (stmt driver.St
 		if pr.IsProcedureCall() {
 			stmt = newCallStmt(c, qd.Query(), pr)
 		} else {
-			stmt = newStmt(c, qd.Query(), qd.IsBulk(), c.ctr.BulkSize(), pr) //take latest connector bulk size
+			stmt = newStmt(c, qd.Query(), qd.IsBulk(), c.bulkSize, pr) //take latest connector bulk size
 		}
 
 	done:
@@ -427,7 +440,8 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (stmt driver.St
 		c.dbConn.cancel()
 		return nil, ctx.Err()
 	case <-done:
-		hdbDriver.addStmt(1) // increment number of statements.
+		c.metrics.addGaugeValue(gaugeStmt, 1) // increment number of statements.
+		c.lastError = err
 		return stmt, err
 	}
 }
@@ -437,14 +451,14 @@ func (c *conn) Close() error {
 	c.lock()
 	defer c.unlock()
 
-	hdbDriver.addConn(-1) // decrement open connections.
-	close(c.closed)       // signal connection close
+	c.metrics.addGaugeValue(gaugeConn, -1) // decrement open connections.
+	close(c.closed)                        // signal connection close
 
 	// cleanup query cache
 	p.QueryResultCache.Cleanup(c.session)
 
 	// if isBad do not disconnect
-	if !c.dbConn.isBad() {
+	if !c.isBad() {
 		c.session.Disconnect() // ignore error
 	}
 	return c.dbConn.close()
@@ -457,7 +471,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (tx driver.Tx
 	}
 	defer c.unlock()
 
-	if c.dbConn.isBad() {
+	if c.isBad() {
 		return nil, driver.ErrBadConn
 	}
 
@@ -473,11 +487,23 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (tx driver.Tx
 	done := make(chan struct{})
 	go func() {
 		// set isolation level
-		if _, err = c.session.ExecDirect(fmt.Sprintf(setIsolationLevel, level), !c.inTx); err != nil {
+		query := fmt.Sprintf(setIsolationLevel, level)
+		c.execSQL(sqlExec, query, nil,
+			func() {
+				_, err = c.session.ExecDirect(query, !c.inTx)
+			},
+		)
+		if err != nil {
 			goto done
 		}
 		// set access mode
-		if _, err = c.session.ExecDirect(fmt.Sprintf(setAccessMode, readOnly[opts.ReadOnly]), !c.inTx); err != nil {
+		query = fmt.Sprintf(setAccessMode, readOnly[opts.ReadOnly])
+		c.execSQL(sqlExec, query, nil,
+			func() {
+				_, err = c.session.ExecDirect(query, !c.inTx)
+			},
+		)
+		if err != nil {
 			goto done
 		}
 		c.inTx = true
@@ -491,7 +517,8 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (tx driver.Tx
 		c.dbConn.cancel()
 		return nil, ctx.Err()
 	case <-done:
-		hdbDriver.addTx(1) // increment number of transactions.
+		c.metrics.addGaugeValue(gaugeTx, 1) // increment number of transactions.
+		c.lastError = err
 		return tx, err
 	}
 }
@@ -509,7 +536,7 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 		}
 	}()
 
-	if c.dbConn.isBad() {
+	if c.isBad() {
 		return nil, driver.ErrBadConn
 	}
 
@@ -540,13 +567,13 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 		return rows, nil
 	}
 
-	if sqltrace.On() {
-		sqltrace.Traceln(query)
-	}
-
 	done := make(chan struct{})
 	go func() {
-		rows, err = c.session.QueryDirect(query, !c.inTx)
+		c.execSQL(sqlQuery, query, nil,
+			func() {
+				rows, err = c.session.QueryDirect(query, !c.inTx)
+			},
+		)
 		close(done)
 	}()
 
@@ -559,6 +586,7 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 			onCloser.SetOnClose(c.unlock)
 			hasRowsCloser = true
 		}
+		c.lastError = err
 		return rows, err
 	}
 }
@@ -570,7 +598,7 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	}
 	defer c.unlock()
 
-	if c.dbConn.isBad() {
+	if c.isBad() {
 		return nil, driver.ErrBadConn
 	}
 
@@ -583,16 +611,16 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 		return nil, err
 	}
 
-	if sqltrace.On() {
-		sqltrace.Traceln(query)
-	}
-
 	done := make(chan struct{})
 	go func() {
 		/*
 			handle call procedure (qd.Kind() == p.QkCall) without parameters here as well
 		*/
-		r, err = c.session.ExecDirect(qd.Query(), !c.inTx)
+		c.execSQL(sqlExec, qd.Query(), nil,
+			func() {
+				r, err = c.session.ExecDirect(qd.Query(), !c.inTx)
+			},
+		)
 		close(done)
 	}()
 
@@ -601,6 +629,7 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 		c.dbConn.cancel()
 		return nil, ctx.Err()
 	case <-done:
+		c.lastError = err
 		return r, err
 	}
 }
@@ -630,7 +659,7 @@ func (c *conn) DBConnectInfo(ctx context.Context, databaseName string) (ci *hdb.
 	}
 	defer c.unlock()
 
-	if c.dbConn.isBad() {
+	if c.isBad() {
 		return nil, driver.ErrBadConn
 	}
 
@@ -645,13 +674,31 @@ func (c *conn) DBConnectInfo(ctx context.Context, databaseName string) (ci *hdb.
 		c.dbConn.cancel()
 		return nil, ctx.Err()
 	case <-done:
+		c.lastError = err
 		return ci, err
 	}
 }
 
+func (c *conn) execSQL(k int, query string, nvargs []driver.NamedValue, fn func()) {
+	start := time.Now()
+	fn()
+	ms := time.Since(start).Milliseconds()
+	if c.trace {
+		switch {
+		case len(nvargs) == 0:
+			sqltrace.Tracef("%s duration %dms", query, ms)
+		case len(nvargs) > maxNumTraceArg:
+			sqltrace.Tracef("%s args(limited to %d) %v duration %dms", query, maxNumTraceArg, nvargs[:maxNumTraceArg], ms)
+		default:
+			sqltrace.Tracef("%s args %v duration %dms", query, nvargs, ms)
+		}
+	}
+	c.metrics.addDurationHistogramValue(k, ms)
+}
+
 //transaction
 
-//  check if tx implements all required interfaces
+// check if tx implements all required interfaces
 var (
 	_ driver.Tx = (*tx)(nil)
 )
@@ -666,7 +713,7 @@ func newTx(conn *conn) *tx { return &tx{conn: conn} }
 func (t *tx) Commit() error   { return t.close(false) }
 func (t *tx) Rollback() error { return t.close(true) }
 
-func (t *tx) close(rollback bool) error {
+func (t *tx) close(rollback bool) (err error) {
 	c := t.conn
 
 	c.lock()
@@ -677,39 +724,41 @@ func (t *tx) close(rollback bool) error {
 	}
 	t.closed = true
 
-	if c.dbConn.isBad() {
+	c.inTx = false
+
+	c.metrics.addGaugeValue(gaugeTx, -1) // decrement number of transactions.
+
+	if c.isBad() {
 		return driver.ErrBadConn
 	}
 
-	c.inTx = false
-
-	hdbDriver.addTx(-1) // decrement number of transactions.
-
 	if rollback {
-		return c.session.Rollback()
+		c.execSQL(sqlRollback, "rollback", nil,
+			func() {
+				err = c.session.Rollback()
+			},
+		)
+		return
 	}
-	return c.session.Commit()
+	c.execSQL(sqlCommit, "commit", nil,
+		func() {
+			err = c.session.Commit()
+		},
+	)
+	return
 }
 
 /*
 statements
 
-args interface to session
-. []interface{} (args) instead of []driver.NamedValue (nvargs) is used as
-  . bulk / many operations would have a huge allocation effort / overhead
-    converting args to nvargs
-  . drawback: nvargs for simply query and exec stmts need to convert nvargs to args
-
-nvargs
+nvargs // TODO handling of nvargs when real named args are supported (v1.0.0)
 . check support (v1.0.0)
   . call (most probably as HANA does support parameter names)
   . query input parameters (most probably not, as HANA does not support them)
   . exec input parameters (could be done (map to table field name) but is it worth the effort?
 */
 
-// TODO handling of nvargs when real named args are supported (v1.0.0)
-
-//  check if statements implements all required interfaces
+// check if statements implements all required interfaces
 var (
 	_ driver.Stmt              = (*stmt)(nil)
 	_ driver.StmtExecContext   = (*stmt)(nil)
@@ -722,42 +771,17 @@ var (
 	_ driver.NamedValueChecker = (*callStmt)(nil)
 )
 
-type argsPool struct {
-	sync.Pool
-}
-
-func (ap *argsPool) put(v []interface{}) { ap.Put(v) }
-
-func (ap *argsPool) getSize(size int) []interface{} {
-	v := ap.Get()
-	if v == nil || cap(v.([]interface{})) < size {
-		return make([]interface{}, size)
-	}
-	return v.([]interface{})[0:size]
-}
-
-func (ap *argsPool) getNVArgs(nvargs []driver.NamedValue) []interface{} {
-	v := ap.getSize(len(nvargs))
-	for i, nv := range nvargs {
-		v[i] = nv.Value
-	}
-	return v
-}
-
-var smallArgsPool = argsPool{} // rather small slices
-
 type stmt struct {
 	conn              *conn
 	query             string
 	pr                *p.PrepareResult
 	bulk, flush, many bool
 	bulkSize, numBulk int
-	trace             bool          // store flag for performance reasons (especially bulk inserts)
-	args              []interface{} // bulk or many
+	nvargs            []driver.NamedValue // bulk or many
 }
 
 func newStmt(conn *conn, query string, bulk bool, bulkSize int, pr *p.PrepareResult) *stmt {
-	return &stmt{conn: conn, query: query, pr: pr, bulk: bulk, bulkSize: bulkSize, trace: sqltrace.On()}
+	return &stmt{conn: conn, query: query, pr: pr, bulk: bulk, bulkSize: bulkSize}
 }
 
 type callStmt struct {
@@ -771,11 +795,11 @@ func newCallStmt(conn *conn, query string, pr *p.PrepareResult) *callStmt {
 }
 
 /*
-	NumInput differs dependent on statement (check is done in QueryContext and ExecContext):
-	- #args == #param (only in params):    query, exec, exec bulk (non control query)
-	- #args == #param (in and out params): exec call
-	- #args == 0:                          exec bulk (control query)
-	- #args == #input param:               query call
+NumInput differs dependent on statement (check is done in QueryContext and ExecContext):
+- #args == #param (only in params):    query, exec, exec bulk (non control query)
+- #args == #param (in and out params): exec call
+- #args == 0:                          exec bulk (control query)
+- #args == #input param:               query call
 */
 func (s *stmt) NumInput() int     { return -1 }
 func (s *callStmt) NumInput() int { return -1 }
@@ -788,10 +812,10 @@ reset args
 - free elements (GC)
 */
 func (s *stmt) resetArgs() {
-	for i := 0; i < len(s.args); i++ {
-		s.args[i] = nil
+	for i := 0; i < len(s.nvargs); i++ {
+		s.nvargs[i].Value = nil
 	}
-	s.args = s.args[:0]
+	s.nvargs = s.nvargs[:0]
 }
 
 func (s *stmt) Close() error {
@@ -800,17 +824,17 @@ func (s *stmt) Close() error {
 	c.lock()
 	defer c.unlock()
 
-	if c.dbConn.isBad() {
+	s.conn.metrics.addGaugeValue(gaugeStmt, -1) // decrement number of statements.
+
+	if c.isBad() {
 		return driver.ErrBadConn
 	}
 
-	hdbDriver.addStmt(-1) // decrement number of statements.
-
-	if s.args != nil {
-		if len(s.args) != 0 { // log always //TODO: Fatal?
-			dlog.Printf("close: %s - not flushed records: %d)", s.query, len(s.args)/s.pr.NumField())
+	if s.nvargs != nil {
+		if len(s.nvargs) != 0 { // log always //TODO: Fatal?
+			dlog.Printf("close: %s - not flushed records: %d)", s.query, len(s.nvargs)/s.pr.NumField())
 		}
-		s.args = nil
+		s.nvargs = nil
 	}
 
 	return c.session.DropStatementID(s.pr.StmtID())
@@ -830,24 +854,21 @@ func (s *stmt) QueryContext(ctx context.Context, nvargs []driver.NamedValue) (ro
 		}
 	}()
 
-	if c.dbConn.isBad() {
+	if c.isBad() {
 		return nil, driver.ErrBadConn
 	}
 
-	args := smallArgsPool.getNVArgs(nvargs)
-	defer smallArgsPool.put(args)
-
-	if s.trace {
-		sqltrace.Tracef("%s %v", s.query, args)
-	}
-
-	if len(args) != s.pr.NumField() { // all fields needs to be input fields
-		return nil, fmt.Errorf("invalid number of arguments %d - %d expected", len(args), s.pr.NumField())
+	if len(nvargs) != s.pr.NumField() { // all fields needs to be input fields
+		return nil, fmt.Errorf("invalid number of arguments %d - %d expected", len(nvargs), s.pr.NumField())
 	}
 
 	done := make(chan struct{})
 	go func() {
-		rows, err = c.session.Query(s.pr, args, !c.inTx)
+		c.execSQL(sqlQuery, s.query, nvargs,
+			func() {
+				rows, err = c.session.Query(s.pr, nvargs, !c.inTx)
+			},
+		)
 		close(done)
 	}()
 
@@ -860,6 +881,7 @@ func (s *stmt) QueryContext(ctx context.Context, nvargs []driver.NamedValue) (ro
 			onCloser.SetOnClose(c.unlock)
 			hasRowsCloser = true
 		}
+		c.lastError = err
 		return rows, err
 	}
 }
@@ -884,13 +906,11 @@ func (s *stmt) ExecContext(ctx context.Context, nvargs []driver.NamedValue) (dri
 		if numArg != s.pr.NumField() {
 			return nil, fmt.Errorf("invalid number of arguments %d - %d expected", numArg, s.pr.NumField())
 		}
-		args := smallArgsPool.getNVArgs(nvargs)
-		defer smallArgsPool.put(args)
-		return s.exec(ctx, args)
+		return s.exec(ctx, nvargs)
 	}
 }
 
-func (s *stmt) exec(ctx context.Context, args []interface{}) (r driver.Result, err error) {
+func (s *stmt) exec(ctx context.Context, nvargs []driver.NamedValue) (r driver.Result, err error) {
 	c := s.conn
 
 	if err := c.tryLock(0); err != nil {
@@ -898,7 +918,7 @@ func (s *stmt) exec(ctx context.Context, args []interface{}) (r driver.Result, e
 	}
 	defer c.unlock()
 
-	if c.dbConn.isBad() {
+	if c.isBad() {
 		return nil, driver.ErrBadConn
 	}
 
@@ -906,17 +926,13 @@ func (s *stmt) exec(ctx context.Context, args []interface{}) (r driver.Result, e
 		connHook(c, choStmtExec)
 	}
 
-	if s.trace {
-		if len(args) > maxNumTraceArg {
-			sqltrace.Tracef("%s first %d arguments: %v", s.query, maxNumTraceArg, args[:maxNumTraceArg])
-		} else {
-			sqltrace.Tracef("%s %v", s.query, args)
-		}
-	}
-
 	done := make(chan struct{})
 	go func() {
-		r, err = c.session.Exec(s.pr, args, !c.inTx)
+		c.execSQL(sqlExec, s.query, nvargs,
+			func() {
+				r, err = c.session.Exec(s.pr, nvargs, !c.inTx)
+			},
+		)
 		close(done)
 	}()
 
@@ -925,6 +941,7 @@ func (s *stmt) exec(ctx context.Context, args []interface{}) (r driver.Result, e
 		c.dbConn.cancel()
 		return nil, ctx.Err()
 	case <-done:
+		c.lastError = err
 		return r, err
 	}
 }
@@ -936,12 +953,7 @@ func (s *stmt) execBulk(ctx context.Context, nvargs []driver.NamedValue, flush b
 	case 0: // exec without args --> flush
 		flush = true
 	default: // add to argument buffer
-		if s.args == nil {
-			s.args = make([]interface{}, 0, s.pr.NumField()*s.bulkSize)
-		}
-		for _, nv := range nvargs {
-			s.args = append(s.args, nv.Value)
-		}
+		s.nvargs = append(s.nvargs, nvargs...)
 		s.numBulk++
 		if s.numBulk >= s.bulkSize {
 			flush = true
@@ -953,7 +965,7 @@ func (s *stmt) execBulk(ctx context.Context, nvargs []driver.NamedValue, flush b
 	}
 
 	// flush
-	r, err = s.exec(ctx, s.args)
+	r, err = s.exec(ctx, s.nvargs)
 	s.resetArgs()
 	s.numBulk = 0
 	return
@@ -965,7 +977,7 @@ execMany variants
 
 type execManyer interface {
 	numRow() int
-	fill(pr *p.PrepareResult, startRow, endRow int, args []interface{}) error
+	fill(pr *p.PrepareResult, startRow, endRow int, nvargs []driver.NamedValue) error
 }
 
 type execManyIntfList []interface{}
@@ -978,32 +990,32 @@ func (em execManyIntfMatrix) numRow() int { return len(em) }
 func (em execManyGenList) numRow() int    { return reflect.Value(em).Len() }
 func (em execManyGenMatrix) numRow() int  { return reflect.Value(em).Len() }
 
-func (em execManyIntfList) fill(pr *p.PrepareResult, startRow, endRow int, args []interface{}) error {
+func (em execManyIntfList) fill(pr *p.PrepareResult, startRow, endRow int, nvargs []driver.NamedValue) error {
 	rows := em[startRow:endRow]
 	for i, row := range rows {
 		row, err := convertValue(pr, 0, row)
 		if err != nil {
 			return err
 		}
-		args[i] = row
+		nvargs[i].Value = row
 	}
 	return nil
 }
 
-func (em execManyGenList) fill(pr *p.PrepareResult, startRow, endRow int, args []interface{}) error {
+func (em execManyGenList) fill(pr *p.PrepareResult, startRow, endRow int, nvargs []driver.NamedValue) error {
 	cnt := 0
 	for i := startRow; i < endRow; i++ {
 		row, err := convertValue(pr, 0, reflect.Value(em).Index(i).Interface())
 		if err != nil {
 			return err
 		}
-		args[cnt] = row
+		nvargs[cnt].Value = row
 		cnt++
 	}
 	return nil
 }
 
-func (em execManyIntfMatrix) fill(pr *p.PrepareResult, startRow, endRow int, args []interface{}) error {
+func (em execManyIntfMatrix) fill(pr *p.PrepareResult, startRow, endRow int, nvargs []driver.NamedValue) error {
 	numField := pr.NumField()
 	rows := em[startRow:endRow]
 	cnt := 0
@@ -1016,14 +1028,14 @@ func (em execManyIntfMatrix) fill(pr *p.PrepareResult, startRow, endRow int, arg
 			if err != nil {
 				return err
 			}
-			args[cnt] = col
+			nvargs[cnt].Value = col
 			cnt++
 		}
 	}
 	return nil
 }
 
-func (em execManyGenMatrix) fill(pr *p.PrepareResult, startRow, endRow int, args []interface{}) error {
+func (em execManyGenMatrix) fill(pr *p.PrepareResult, startRow, endRow int, nvargs []driver.NamedValue) error {
 	numField := pr.NumField()
 	cnt := 0
 	for i := startRow; i < endRow; i++ {
@@ -1041,7 +1053,7 @@ func (em execManyGenMatrix) fill(pr *p.PrepareResult, startRow, endRow int, args
 			if err != nil {
 				return err
 			}
-			args[cnt] = col
+			nvargs[cnt].Value = col
 			cnt++
 		}
 	}
@@ -1074,8 +1086,8 @@ execMany data might only be written partially to the database in case of hdb stm
 */
 func (s *stmt) execMany(ctx context.Context, nvarg *driver.NamedValue) (driver.Result, error) {
 
-	if len(s.args) != 0 {
-		return driver.ResultNoRows, fmt.Errorf("execMany: not flushed entries: %d)", len(s.args))
+	if len(s.nvargs) != 0 {
+		return driver.ResultNoRows, fmt.Errorf("execMany: not flushed entries: %d)", len(s.nvargs))
 	}
 
 	numField := s.pr.NumField()
@@ -1088,10 +1100,10 @@ func (s *stmt) execMany(ctx context.Context, nvarg *driver.NamedValue) (driver.R
 	numRow := variant.numRow()
 
 	size := min(numRow*numField, s.bulkSize*numField)
-	if s.args == nil || cap(s.args) < size {
-		s.args = make([]interface{}, size)
+	if s.nvargs == nil || cap(s.nvargs) < size {
+		s.nvargs = make([]driver.NamedValue, size)
 	} else {
-		s.args = s.args[:size]
+		s.nvargs = s.nvargs[:size]
 	}
 
 	numPack := numRow / s.bulkSize
@@ -1104,14 +1116,14 @@ func (s *stmt) execMany(ctx context.Context, nvarg *driver.NamedValue) (driver.R
 		startRow := p * s.bulkSize
 		endRow := min(startRow+s.bulkSize, numRow)
 
-		args := s.args[0 : (endRow-startRow)*numField]
+		nvargs := s.nvargs[0 : (endRow-startRow)*numField]
 
-		if err := variant.fill(s.pr, startRow, endRow, args); err != nil {
+		if err := variant.fill(s.pr, startRow, endRow, nvargs); err != nil {
 			return driver.RowsAffected(totalRowsAffected), err
 		}
 
 		// flush
-		r, err := s.exec(ctx, args)
+		r, err := s.exec(ctx, nvargs)
 		if err != nil {
 			return driver.RowsAffected(totalRowsAffected), err
 		}
@@ -1166,11 +1178,11 @@ func (s *callStmt) Close() error {
 	c.lock()
 	defer c.unlock()
 
-	if c.dbConn.isBad() {
+	if c.isBad() {
 		return driver.ErrBadConn
 	}
 
-	hdbDriver.addStmt(-1) // decrement number of statements.
+	s.conn.metrics.addGaugeValue(gaugeStmt, -1) // decrement number of statements.
 
 	return c.session.DropStatementID(s.pr.StmtID())
 }
@@ -1189,24 +1201,21 @@ func (s *callStmt) QueryContext(ctx context.Context, nvargs []driver.NamedValue)
 		}
 	}()
 
-	if c.dbConn.isBad() {
+	if c.isBad() {
 		return nil, driver.ErrBadConn
 	}
 
-	args := smallArgsPool.getNVArgs(nvargs)
-	defer smallArgsPool.put(args)
-
-	if sqltrace.On() {
-		sqltrace.Tracef("%s %v", s.query, args)
-	}
-
-	if len(args) != s.pr.NumInputField() { // input fields only
-		return nil, fmt.Errorf("invalid number of arguments %d - %d expected", len(args), s.pr.NumInputField())
+	if len(nvargs) != s.pr.NumInputField() { // input fields only
+		return nil, fmt.Errorf("invalid number of arguments %d - %d expected", len(nvargs), s.pr.NumInputField())
 	}
 
 	done := make(chan struct{})
 	go func() {
-		rows, err = c.session.QueryCall(s.pr, args)
+		c.execSQL(sqlQuery, s.query, nvargs,
+			func() {
+				rows, err = c.session.QueryCall(s.pr, nvargs)
+			},
+		)
 		close(done)
 	}()
 
@@ -1219,6 +1228,7 @@ func (s *callStmt) QueryContext(ctx context.Context, nvargs []driver.NamedValue)
 			onCloser.SetOnClose(c.unlock)
 			hasRowsCloser = true
 		}
+		c.lastError = err
 		return rows, err
 	}
 }
@@ -1231,24 +1241,21 @@ func (s *callStmt) ExecContext(ctx context.Context, nvargs []driver.NamedValue) 
 	}
 	defer c.unlock()
 
-	if c.dbConn.isBad() {
+	if c.isBad() {
 		return nil, driver.ErrBadConn
 	}
 
-	args := smallArgsPool.getNVArgs(nvargs)
-	defer smallArgsPool.put(args)
-
-	if sqltrace.On() {
-		sqltrace.Tracef("%s %v", s.query, args)
-	}
-
-	if len(args) != s.pr.NumField() {
-		return nil, fmt.Errorf("invalid number of arguments %d - %d expected", len(args), s.pr.NumField())
+	if len(nvargs) != s.pr.NumField() {
+		return nil, fmt.Errorf("invalid number of arguments %d - %d expected", len(nvargs), s.pr.NumField())
 	}
 
 	done := make(chan struct{})
 	go func() {
-		r, err = c.session.ExecCall(s.pr, args)
+		c.execSQL(sqlExec, s.query, nvargs,
+			func() {
+				r, err = c.session.ExecCall(s.pr, nvargs)
+			},
+		)
 		close(done)
 	}()
 
@@ -1257,6 +1264,7 @@ func (s *callStmt) ExecContext(ctx context.Context, nvargs []driver.NamedValue) 
 		c.dbConn.cancel()
 		return nil, ctx.Err()
 	case <-done:
+		c.lastError = err
 		return r, err
 	}
 }
