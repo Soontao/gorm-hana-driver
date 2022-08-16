@@ -9,51 +9,56 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"os"
-	"sync/atomic"
+	"strconv"
+	"strings"
 )
 
 // DriverVersion is the version number of the hdb driver.
-const DriverVersion = "0.105.8"
+const DriverVersion = "0.107.3"
 
 // DriverName is the driver name to use with sql.Open for hdb databases.
 const DriverName = "hdb"
 
-// default application name.
-var defaultApplicationName string
+var clientID = func() string {
+	if hostname, err := os.Hostname(); err == nil {
+		return strings.Join([]string{strconv.Itoa(os.Getpid()), hostname}, "@")
+	}
+	return strconv.Itoa(os.Getpid())
+}()
 
-var hdbDriver = &Driver{}
+// clientType is the information provided to HDB identifying the driver.
+// Previously the driver.DriverName "hdb" was used but we should be more specific in providing a unique client type to HANA backend.
+const clientType = "go-hdb"
+
+var defaultApplicationName, _ = os.Executable()
+
+// driver singleton instance (do not use directly - use getDriver() instead)
+var hdbDriver *Driver
 
 func init() {
-	defaultApplicationName, _ = os.Executable()
+	// load stats configuration
+	if err := loadStatsCfg(); err != nil {
+		panic(err) // invalid configuration file
+	}
+
+	// instantiate hdbDriver
+	hdbDriver = &Driver{newMetrics(nil, statsCfg.TimeBuckets)}
+	// register driver
 	sql.Register(DriverName, hdbDriver)
 }
 
 // driver
 
-//  check if driver implements all required interfaces
+// check if driver implements all required interfaces
 var (
 	_ driver.Driver        = (*Driver)(nil)
 	_ driver.DriverContext = (*Driver)(nil)
 )
 
-// Stats contains driver statistics.
-type Stats struct {
-	OpenConnections  int // Number of open driver connections.
-	OpenTransactions int // Number of open driver transactions.
-	OpenStatements   int // Number of open driver database statements.
-}
-
 // Driver represents the go sql driver implementation for hdb.
 type Driver struct {
-	// Atomic access only. At top of struct to prevent mis-alignment on 32-bit platforms.
-	numConn int64 // Number of connections.
-	numTx   int64 // Number of transactions.
-	numStmt int64 // Number of statements.
+	metrics *metrics
 }
-
-func (d *Driver) addConn(delta int64) { atomic.AddInt64(&d.numConn, delta) }
-func (d *Driver) addTx(delta int64)   { atomic.AddInt64(&d.numTx, delta) }
-func (d *Driver) addStmt(delta int64) { atomic.AddInt64(&d.numStmt, delta) }
 
 // Open implements the driver.Driver interface.
 func (d *Driver) Open(dsn string) (driver.Conn, error) {
@@ -74,10 +79,4 @@ func (d *Driver) Name() string { return DriverName }
 func (d *Driver) Version() string { return DriverVersion }
 
 // Stats returns driver statistics.
-func (d *Driver) Stats() Stats {
-	return Stats{
-		OpenConnections:  int(atomic.LoadInt64(&d.numConn)),
-		OpenTransactions: int(atomic.LoadInt64(&d.numTx)),
-		OpenStatements:   int(atomic.LoadInt64(&d.numStmt)),
-	}
-}
+func (d *Driver) Stats() Stats { return d.metrics.stats() }

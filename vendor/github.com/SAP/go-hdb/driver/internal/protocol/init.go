@@ -10,8 +10,11 @@ import (
 	"github.com/SAP/go-hdb/driver/internal/protocol/encoding"
 )
 
+type endianess int8
+
 const (
-	okEndianess int8 = 1
+	bigEndian    endianess = 0
+	littleEndian endianess = 1
 )
 
 const (
@@ -56,7 +59,7 @@ func (r *initRequest) decode(dec *encoding.Decoder) error {
 
 	switch r.numOptions {
 	default:
-		plog.Fatalf("invalid number of options %d", r.numOptions)
+		panic(fmt.Sprintf("invalid number of options %d", r.numOptions))
 
 	case 0:
 		dec.Skip(2)
@@ -64,7 +67,7 @@ func (r *initRequest) decode(dec *encoding.Decoder) error {
 	case 1:
 		cnt := dec.Int8()
 		if cnt != 1 {
-			plog.Fatalf("endianess %d - 1 expected", cnt)
+			panic(fmt.Sprintf("invalid number of options %d - 1 expected", cnt))
 		}
 		r.endianess = endianess(dec.Int8())
 	}
@@ -80,7 +83,7 @@ func (r *initRequest) encode(enc *encoding.Encoder) error {
 
 	switch r.numOptions {
 	default:
-		plog.Fatalf("invalid number of options %d", r.numOptions)
+		panic(fmt.Sprintf("invalid number of options %d", r.numOptions))
 
 	case 0:
 		enc.Zeroes(4)
@@ -89,7 +92,7 @@ func (r *initRequest) encode(enc *encoding.Encoder) error {
 		// reserved
 		enc.Zeroes(1)
 		enc.Int8(r.numOptions)
-		enc.Int8(okEndianess)
+		enc.Int8(int8(littleEndian))
 		enc.Int8(int8(r.endianess))
 	}
 	return nil
