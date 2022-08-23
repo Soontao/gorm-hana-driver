@@ -9,8 +9,6 @@ import (
 	"strings"
 )
 
-//go:generate stringer -type=typeCode
-
 // typeCode identify the type of a field transferred to or from the database.
 type typeCode byte
 
@@ -83,11 +81,13 @@ const (
 	// special null values
 	tcSecondtimeNull typeCode = 0xB0
 
-	// additional internal typecodes
-	tcTableRef  typeCode = 0x7e // 126
-	tcTableRows typeCode = 0x7f // 127
+	// TcTableRef is the TypeCode for table references.
+	TcTableRef typeCode = 0x7e // 126
+	// TcTableRows is the TypeCode for table rows.
+	TcTableRows typeCode = 0x7f // 127
 )
 
+// isLob returns true if the TypeCode represents a Lob, false otherwise.
 func (tc typeCode) isLob() bool {
 	return tc == tcClob || tc == tcNclob || tc == tcBlob || tc == tcText || tc == tcBintext || tc == tcLocator || tc == tcNlocator
 }
@@ -100,7 +100,6 @@ func (tc typeCode) isDecimalType() bool {
 	return tc == tcSmalldecimal || tc == tcDecimal || tc == tcFixed8 || tc == tcFixed12 || tc == tcFixed16
 }
 
-//
 func (tc typeCode) supportNullValue() bool {
 	// boolean values: false =:= 0; null =:= 1; true =:= 2
 	return !(tc == tcBoolean)
@@ -164,16 +163,16 @@ func (tc typeCode) dataType() DataType {
 		return DtTime
 	case tcDecimal, tcFixed8, tcFixed12, tcFixed16:
 		return DtDecimal
-	case tcChar, tcVarchar, tcString, tcAlphanum, tcNchar, tcNvarchar, tcNstring, tcShorttext, tcStPoint, tcStGeometry, tcTableRef:
+	case tcChar, tcVarchar, tcString, tcAlphanum, tcNchar, tcNvarchar, tcNstring, tcShorttext, tcStPoint, tcStGeometry, TcTableRef:
 		return DtString
 	case tcBinary, tcVarbinary:
 		return DtBytes
 	case tcBlob, tcClob, tcNclob, tcText, tcBintext:
 		return DtLob
-	case tcTableRows:
+	case TcTableRows:
 		return DtRows
 	default:
-		panic(fmt.Sprintf("Missing DataType for typeCode %s", tc))
+		panic(fmt.Sprintf("missing DataType for typeCode %s", tc))
 	}
 }
 
@@ -239,6 +238,27 @@ func (tc typeCode) fieldType(length, fraction int) fieldType {
 	case tcFixed16:
 		return _fixed16Type{prec: length, scale: fraction} // used for decimals(x,y) 2^63 - 1 (int128)
 	default:
-		panic(fmt.Sprintf("Missing FieldType for typeCode %s", tc))
+		panic(fmt.Sprintf("missing fieldType for typeCode %s", tc))
+	}
+}
+
+func (tc typeCode) optType() optType {
+	switch tc {
+	case tcBoolean:
+		return optBooleanType
+	case tcTinyint:
+		return optTinyintType
+	case tcInteger:
+		return optIntegerType
+	case tcBigint:
+		return optBigintType
+	case tcDouble:
+		return optDoubleType
+	case tcString:
+		return optStringType
+	case tcBstring:
+		return optBstringType
+	default:
+		panic(fmt.Sprintf("missing optType for typeCode %s", tc))
 	}
 }
