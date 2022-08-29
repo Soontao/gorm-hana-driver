@@ -11,8 +11,6 @@ import (
 	"time"
 )
 
-//go:generate stringer -type=DataType
-
 // DataType is the type definition for data types supported by this package.
 type DataType byte
 
@@ -35,11 +33,12 @@ const (
 )
 
 // RegisterScanType registers driver owned datatype scantypes (e.g. Decimal, Lob).
-func RegisterScanType(dt DataType, scanType reflect.Type) {
-	scanTypeMap[dt] = scanType
+func RegisterScanType(dt DataType, scanType reflect.Type) bool {
+	scanTypes[dt] = scanType
+	return true
 }
 
-var scanTypeMap = map[DataType]reflect.Type{
+var scanTypes = []reflect.Type{
 	DtUnknown:  reflect.TypeOf((*interface{})(nil)).Elem(),
 	DtBoolean:  reflect.TypeOf((*bool)(nil)).Elem(),
 	DtTinyint:  reflect.TypeOf((*uint8)(nil)).Elem(),
@@ -58,9 +57,9 @@ var scanTypeMap = map[DataType]reflect.Type{
 
 // ScanType return the scan type (reflect.Type) of the corresponding data type.
 func (dt DataType) ScanType() reflect.Type {
-	st, ok := scanTypeMap[dt]
-	if !ok {
-		panic(fmt.Sprintf("Missing ScanType for DataType %s", dt))
+	st := scanTypes[dt]
+	if st == nil {
+		panic(fmt.Sprintf("ScanType for DataType %s not registered", dt))
 	}
 	return st
 }

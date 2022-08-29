@@ -11,6 +11,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/SAP/go-hdb/driver/internal/errors"
+
 	"golang.org/x/text/transform"
 )
 
@@ -35,7 +37,7 @@ func newDecodeError(enc string, p int, v []byte) *DecodeError {
 }
 
 func (e *DecodeError) Error() string {
-	return fmt.Sprintf("invalid %s: %x at pos: %d", e.enc, e.v, e.p)
+	return fmt.Sprintf("invalid %s: %x at position %d", e.enc, e.v, e.p)
 }
 
 // Enc returns the expected encoding of the erroneous data.
@@ -46,6 +48,9 @@ func (e *DecodeError) Pos() int { return e.p }
 
 // Value returns the value which should be decoded.
 func (e *DecodeError) Value() []byte { return e.v }
+
+// Is returns true on the target driver errors.Fatal, false otherwise.
+func (e *DecodeError) Is(target error) bool { return target == errors.ErrFatal }
 
 // Encoder supports encoding of UTF-8 encoded data into CESU-8.
 type Encoder struct {
@@ -74,7 +79,7 @@ func (e *Encoder) Transform(dst, src []byte, atEOF bool) (nDst, nSrc int, err er
 		}
 		// check if additional bytes needed (ErrShortSrc) only
 		// - if further bytes are potentially available (!atEOF) and
-		// - remainig buffer smaller than max size for an ecoded UTF-8 rune
+		// - remaining buffer smaller than max size for an ecoded UTF-8 rune
 		if !atEOF && len(src[i:]) < utf8.UTFMax {
 			if !utf8.FullRune(src[i:]) {
 				return j, i, transform.ErrShortSrc
@@ -132,7 +137,7 @@ func (d *Decoder) Transform(dst, src []byte, atEOF bool) (nDst, nSrc int, err er
 		}
 		// check if additional bytes needed (ErrShortSrc) only
 		// - if further bytes are potentially available (!atEOF) and
-		// - remainig buffer smaller than max size for an ecoded CESU-8 rune
+		// - remaining buffer smaller than max size for an ecoded CESU-8 rune
 		if !atEOF && len(src[i:]) < CESUMax {
 			if !FullRune(src[i:]) {
 				return j, i, transform.ErrShortSrc
