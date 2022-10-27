@@ -1,16 +1,17 @@
-# github.com/SAP/go-hdb v0.105.8
+# github.com/SAP/go-hdb v0.109.2
 ## explicit
 github.com/SAP/go-hdb/driver
 github.com/SAP/go-hdb/driver/dial
-github.com/SAP/go-hdb/driver/hdb
-github.com/SAP/go-hdb/driver/internal/container/vermap
+github.com/SAP/go-hdb/driver/internal/errors
+github.com/SAP/go-hdb/driver/internal/logflag
 github.com/SAP/go-hdb/driver/internal/protocol
+github.com/SAP/go-hdb/driver/internal/protocol/auth
 github.com/SAP/go-hdb/driver/internal/protocol/encoding
+github.com/SAP/go-hdb/driver/internal/protocol/julian
 github.com/SAP/go-hdb/driver/internal/protocol/scanner
-github.com/SAP/go-hdb/driver/internal/rand
 github.com/SAP/go-hdb/driver/sqltrace
 github.com/SAP/go-hdb/driver/unicode/cesu8
-# github.com/davecgh/go-spew v1.1.0
+# github.com/davecgh/go-spew v1.1.1
 github.com/davecgh/go-spew/spew
 # github.com/google/uuid v1.3.0
 ## explicit
@@ -25,10 +26,13 @@ github.com/pmezard/go-difflib/difflib
 # github.com/stretchr/testify v1.7.0
 ## explicit
 github.com/stretchr/testify/assert
-# golang.org/x/crypto v0.0.0-20220321153916-2c7772ba3064
-## explicit
+# golang.org/x/crypto v0.1.0
 golang.org/x/crypto/pbkdf2
-# golang.org/x/text v0.3.7
+# golang.org/x/exp v0.0.0-20221026004748-78e5e7837ae6
+golang.org/x/exp/constraints
+golang.org/x/exp/maps
+golang.org/x/exp/slices
+# golang.org/x/text v0.4.0
 golang.org/x/text/transform
 # gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c
 gopkg.in/yaml.v3
