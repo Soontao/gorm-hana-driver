@@ -20,8 +20,10 @@ func Query(db *gorm.DB) {
 				db.AddError(err)
 				return
 			}
+			defer func() {
+				db.AddError(rows.Close())
+			}()
 			gorm.Scan(rows, db, 0)
-			db.AddError(rows.Close())
 		}
 	}
 }
@@ -94,12 +96,12 @@ func BuildQuerySQL(db *gorm.DB) {
 		}
 
 		// inline joins
-		joins := []clause.Join{}
-		if fromClause, ok := db.Statement.Clauses["FROM"].Expression.(clause.From); ok {
-			joins = fromClause.Joins
+		fromClause := clause.From{}
+		if v, ok := db.Statement.Clauses["FROM"].Expression.(clause.From); ok {
+			fromClause = v
 		}
 
-		if len(db.Statement.Joins) != 0 || len(joins) != 0 {
+		if len(db.Statement.Joins) != 0 || len(fromClause.Joins) != 0 {
 			if len(db.Statement.Selects) == 0 && len(db.Statement.Omits) == 0 && db.Statement.Schema != nil {
 				clauseSelect.Columns = make([]clause.Column, len(db.Statement.Schema.DBNames))
 				for idx, dbName := range db.Statement.Schema.DBNames {
@@ -109,18 +111,26 @@ func BuildQuerySQL(db *gorm.DB) {
 
 			for _, join := range db.Statement.Joins {
 				if db.Statement.Schema == nil {
-					joins = append(joins, clause.Join{
+					fromClause.Joins = append(fromClause.Joins, clause.Join{
 						Expression: clause.NamedExpr{SQL: join.Name, Vars: join.Conds},
 					})
 				} else if relation, ok := db.Statement.Schema.Relationships.Relations[join.Name]; ok {
 					tableAliasName := relation.Name
 
+					columnStmt := gorm.Statement{
+						Table: tableAliasName, DB: db, Schema: relation.FieldSchema,
+						Selects: join.Selects, Omits: join.Omits,
+					}
+
+					selectColumns, restricted := columnStmt.SelectAndOmitColumns(false, false)
 					for _, s := range relation.FieldSchema.DBNames {
-						clauseSelect.Columns = append(clauseSelect.Columns, clause.Column{
-							Table: tableAliasName,
-							Name:  s,
-							Alias: tableAliasName + "__" + s,
-						})
+						if v, ok := selectColumns[s]; (ok && v) || (!ok && !restricted) {
+							clauseSelect.Columns = append(clauseSelect.Columns, clause.Column{
+								Table: tableAliasName,
+								Name:  s,
+								Alias: tableAliasName + "__" + s,
+							})
+						}
 					}
 
 					exprs := make([]clause.Expression, len(relation.References))
@@ -174,19 +184,19 @@ func BuildQuerySQL(db *gorm.DB) {
 						}
 					}
 
-					joins = append(joins, clause.Join{
+					fromClause.Joins = append(fromClause.Joins, clause.Join{
 						Type:  clause.LeftJoin,
 						Table: clause.Table{Name: relation.FieldSchema.Table, Alias: tableAliasName},
 						ON:    clause.Where{Exprs: exprs},
 					})
 				} else {
-					joins = append(joins, clause.Join{
+					fromClause.Joins = append(fromClause.Joins, clause.Join{
 						Expression: clause.NamedExpr{SQL: join.Name, Vars: join.Conds},
 					})
 				}
 			}
 
-			db.Statement.AddClause(clause.From{Joins: joins})
+			db.Statement.AddClause(fromClause)
 			db.Statement.Joins = nil
 		} else {
 			db.Statement.AddClauseIfNotExists(clause.From{})
@@ -250,7 +260,7 @@ func Preload(db *gorm.DB) {
 
 		for _, name := range preloadNames {
 			if rel := preloadDB.Statement.Schema.Relationships.Relations[name]; rel != nil {
-				db.AddError(preload(preloadDB.Table("").Session(&gorm.Session{}), rel, append(db.Statement.Preloads[name], db.Statement.Preloads[clause.Associations]...), preloadMap[name]))
+				db.AddError(preload(preloadDB.Table("").Session(&gorm.Session{Context: db.Statement.Context, SkipHooks: db.Statement.SkipHooks}), rel, append(db.Statement.Preloads[name], db.Statement.Preloads[clause.Associations]...), preloadMap[name]))
 			} else {
 				db.AddError(fmt.Errorf("%s: %w for schema %s", name, gorm.ErrUnsupportedRelation, db.Statement.Schema.Name))
 			}
