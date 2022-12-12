@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: 2014-2022 SAP SE
-//
-// SPDX-License-Identifier: Apache-2.0
-
 package driver
 
 import (
@@ -17,7 +13,7 @@ type NullBytes struct {
 }
 
 // Scan implements the Scanner interface.
-func (n *NullBytes) Scan(value interface{}) error {
+func (n *NullBytes) Scan(value any) error {
 	n.Bytes, n.Valid = value.([]byte)
 	return nil
 }
