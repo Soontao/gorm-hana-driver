@@ -1,12 +1,9 @@
-// SPDX-FileCopyrightText: 2014-2022 SAP SE
-//
-// SPDX-License-Identifier: Apache-2.0
-
 package protocol
 
 import (
 	"database/sql/driver"
 	"fmt"
+	"reflect"
 
 	"github.com/SAP/go-hdb/driver/internal/protocol/encoding"
 )
@@ -34,64 +31,59 @@ func (k columnOptions) String() string {
 	return fmt.Sprintf("%v", t)
 }
 
-//resultset id
-type resultsetID uint64
+// ResultsetID represents a resultset id.
+type ResultsetID uint64
 
-func (id resultsetID) String() string { return fmt.Sprintf("%d", id) }
-func (id *resultsetID) decode(dec *encoding.Decoder, ph *partHeader) error {
-	*id = resultsetID(dec.Uint64())
+func (id ResultsetID) String() string { return fmt.Sprintf("%d", id) }
+func (id *ResultsetID) decode(dec *encoding.Decoder, ph *PartHeader) error {
+	*id = ResultsetID(dec.Uint64())
 	return dec.Error()
 }
-func (id resultsetID) encode(enc *encoding.Encoder) error { enc.Uint64(uint64(id)); return nil }
+func (id ResultsetID) encode(enc *encoding.Encoder) error { enc.Uint64(uint64(id)); return nil }
 
-// TODO cache
-func newResultFields(size int) []*resultField {
-	return make([]*resultField, size)
+func newResultFields(size int) []*ResultField {
+	return make([]*ResultField, size)
 }
 
-// resultField contains database field attributes for result fields.
-type resultField struct {
-	// field alignment
-	tableName               string
-	schemaName              string
-	columnName              string
-	columnDisplayName       string
-	ft                      fieldType // avoid tc.fieldType() calls
-	tableNameOffset         uint32
-	schemaNameOffset        uint32
-	columnNameOffset        uint32
-	columnDisplayNameOffset uint32
-	length                  int16
-	fraction                int16
-	columnOptions           columnOptions
-	tc                      typeCode
+// ResultField represents a database result field.
+type ResultField struct {
+	names                *fieldNames
+	ft                   fieldType // avoid tc.fieldType() calls
+	tableNameOfs         uint32
+	schemaNameOfs        uint32
+	columnNameOfs        uint32
+	columnDisplayNameOfs uint32
+	length               int16
+	fraction             int16
+	columnOptions        columnOptions
+	tc                   typeCode
 }
 
 // String implements the Stringer interface.
-func (f *resultField) String() string {
+func (f *ResultField) String() string {
 	return fmt.Sprintf("columnsOptions %s typeCode %s fraction %d length %d tablename %s schemaname %s columnname %s columnDisplayname %s",
 		f.columnOptions,
 		f.tc,
 		f.fraction,
 		f.length,
-		f.tableName,
-		f.schemaName,
-		f.columnName,
-		f.columnDisplayName,
+		f.names.name(f.tableNameOfs),
+		f.names.name(f.schemaNameOfs),
+		f.names.name(f.columnNameOfs),
+		f.names.name(f.columnDisplayNameOfs),
 	)
 }
 
 // TypeName returns the type name of the field.
 // see https://golang.org/pkg/database/sql/driver/#RowsColumnTypeDatabaseTypeName
-func (f *resultField) typeName() string { return f.tc.typeName() }
+func (f *ResultField) TypeName() string { return f.tc.typeName() }
 
 // ScanType returns the scan type of the field.
 // see https://golang.org/pkg/database/sql/driver/#RowsColumnTypeScanType
-func (f *resultField) scanType() DataType { return f.tc.dataType() }
+func (f *ResultField) ScanType() reflect.Type { return f.tc.dataType().ScanType(f.Nullable()) }
 
 // TypeLength returns the type length of the field.
 // see https://golang.org/pkg/database/sql/driver/#RowsColumnTypeLength
-func (f *resultField) typeLength() (int64, bool) {
+func (f *ResultField) TypeLength() (int64, bool) {
 	if f.tc.isVariableLength() {
 		return int64(f.length), true
 	}
@@ -100,7 +92,7 @@ func (f *resultField) typeLength() (int64, bool) {
 
 // TypePrecisionScale returns the type precision and scale (decimal types) of the field.
 // see https://golang.org/pkg/database/sql/driver/#RowsColumnTypePrecisionScale
-func (f *resultField) typePrecisionScale() (int64, int64, bool) {
+func (f *ResultField) TypePrecisionScale() (int64, int64, bool) {
 	if f.tc.isDecimalType() {
 		return int64(f.length), int64(f.fraction), true
 	}
@@ -109,86 +101,76 @@ func (f *resultField) typePrecisionScale() (int64, int64, bool) {
 
 // Nullable returns true if the field may be null, false otherwise.
 // see https://golang.org/pkg/database/sql/driver/#RowsColumnTypeNullable
-func (f *resultField) nullable() bool { return f.columnOptions == coOptional }
+func (f *ResultField) Nullable() bool { return f.columnOptions == coOptional }
 
 // Name returns the result field name.
-func (f *resultField) name() string { return f.columnDisplayName }
+func (f *ResultField) Name() string { return f.names.name(f.columnDisplayNameOfs) }
 
-func (f *resultField) decode(dec *encoding.Decoder) {
+func (f *ResultField) decode(dec *encoding.Decoder) {
 	f.columnOptions = columnOptions(dec.Int8())
 	f.tc = typeCode(dec.Int8())
 	f.fraction = dec.Int16()
 	f.length = dec.Int16()
 	dec.Skip(2) //filler
-	f.tableNameOffset = dec.Uint32()
-	f.schemaNameOffset = dec.Uint32()
-	f.columnNameOffset = dec.Uint32()
-	f.columnDisplayNameOffset = dec.Uint32()
+	f.tableNameOfs = dec.Uint32()
+	f.schemaNameOfs = dec.Uint32()
+	f.columnNameOfs = dec.Uint32()
+	f.columnDisplayNameOfs = dec.Uint32()
+
+	f.names.insert(f.tableNameOfs)
+	f.names.insert(f.schemaNameOfs)
+	f.names.insert(f.columnNameOfs)
+	f.names.insert(f.columnDisplayNameOfs)
+
 	f.ft = f.tc.fieldType(int(f.length), int(f.fraction))
 }
 
-func (f *resultField) decodeRes(dec *encoding.Decoder) (interface{}, error) {
+func (f *ResultField) decodeRes(dec *encoding.Decoder) (any, error) {
 	return f.ft.decodeRes(dec)
 }
 
-//resultset metadata
-type resultMetadata struct {
-	resultFields []*resultField
+// ResultMetadata represents the metadata of a set of database result fields.
+type ResultMetadata struct {
+	ResultFields []*ResultField
 }
 
-func (r *resultMetadata) String() string {
-	return fmt.Sprintf("result fields %v", r.resultFields)
+func (r *ResultMetadata) String() string {
+	return fmt.Sprintf("result fields %v", r.ResultFields)
 }
 
-func (r *resultMetadata) decode(dec *encoding.Decoder, ph *partHeader) error {
-	r.resultFields = newResultFields(ph.numArg())
-
-	names := fieldNames{}
-
-	for i := 0; i < len(r.resultFields); i++ {
-		f := new(resultField)
+func (r *ResultMetadata) decode(dec *encoding.Decoder, ph *PartHeader) error {
+	r.ResultFields = newResultFields(ph.numArg())
+	names := &fieldNames{}
+	for i := 0; i < len(r.ResultFields); i++ {
+		f := &ResultField{names: names}
 		f.decode(dec)
-		r.resultFields[i] = f
-		names.insert(f.tableNameOffset)
-		names.insert(f.schemaNameOffset)
-		names.insert(f.columnNameOffset)
-		names.insert(f.columnDisplayNameOffset)
+		r.ResultFields[i] = f
 	}
-
-	if err := names.decode(dec); err != nil {
-		return err
-	}
-
-	for _, f := range r.resultFields {
-		f.tableName = names.name(f.tableNameOffset)
-		f.schemaName = names.name(f.schemaNameOffset)
-		f.columnName = names.name(f.columnNameOffset)
-		f.columnDisplayName = names.name(f.columnDisplayNameOffset)
-	}
+	names.decode(dec)
 	return dec.Error()
 }
 
-//resultset
-type resultset struct {
-	resultFields []*resultField
-	fieldValues  []driver.Value
-	decodeErrors decodeErrors
+// Resultset represents a database result set.
+type Resultset struct {
+	ResultFields []*ResultField
+	FieldValues  []driver.Value
+	DecodeErrors DecodeErrors
 }
 
-func (r *resultset) String() string {
-	return fmt.Sprintf("result fields %v field values %v", r.resultFields, r.fieldValues)
+func (r *Resultset) String() string {
+	return fmt.Sprintf("result fields %v field values %v", r.ResultFields, r.FieldValues)
 }
 
-func (r *resultset) decode(dec *encoding.Decoder, ph *partHeader) error {
+func (r *Resultset) decode(dec *encoding.Decoder, ph *PartHeader) error {
 	numArg := ph.numArg()
-	cols := len(r.resultFields)
-	r.fieldValues = resizeFieldValues(numArg*cols, r.fieldValues)
+	cols := len(r.ResultFields)
+	r.FieldValues = resizeSlice(r.FieldValues, numArg*cols)
 
 	for i := 0; i < numArg; i++ {
-		for j, f := range r.resultFields {
+		for j, f := range r.ResultFields {
 			var err error
-			if r.fieldValues[i*cols+j], err = f.decodeRes(dec); err != nil {
-				r.decodeErrors = append(r.decodeErrors, &decodeError{row: i, fieldName: f.name(), s: err.Error()}) // collect decode / conversion errors
+			if r.FieldValues[i*cols+j], err = f.decodeRes(dec); err != nil {
+				r.DecodeErrors = append(r.DecodeErrors, &DecodeError{row: i, fieldName: f.Name(), s: err.Error()}) // collect decode / conversion errors
 			}
 		}
 	}
