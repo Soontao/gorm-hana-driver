@@ -1,16 +1,64 @@
-// SPDX-FileCopyrightText: 2014-2022 SAP SE
-//
-// SPDX-License-Identifier: Apache-2.0
-
 package driver
 
 import (
+	"bytes"
 	"database/sql/driver"
 	"fmt"
 	"io"
 
 	p "github.com/SAP/go-hdb/driver/internal/protocol"
 )
+
+func scanLob(src any, wr io.Writer) error {
+	scanner, ok := src.(p.LobScanner)
+	if !ok {
+		return fmt.Errorf("lob: invalid scan type %T", src)
+	}
+	if err := scanner.Scan(wr); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ScanLobBytes supports scanning Lob data into a byte slice.
+// This enables using []byte based custom types for scanning Lobs instead of using a Lob object.
+// For usage please refer to the example.
+func ScanLobBytes(src any, b *[]byte) error {
+	if b == nil {
+		return fmt.Errorf("lob scan error: parameter b %T is nil", b)
+	}
+	wr := new(bytes.Buffer)
+	if err := scanLob(src, wr); err != nil {
+		return err
+	}
+	*b = wr.Bytes()
+	return nil
+}
+
+// ScanLobString supports scanning Lob data into a string.
+// This enables using string based custom types for scanning Lobs instead of using a Lob object.
+// For usage please refer to the example.
+func ScanLobString(src any, s *string) error {
+	if s == nil {
+		return fmt.Errorf("lob scan error: parameter s %T is nil", s)
+	}
+	wr := new(bytes.Buffer)
+	if err := scanLob(src, wr); err != nil {
+		return err
+	}
+	*s = wr.String()
+	return nil
+}
+
+// ScanLobWriter supports scanning Lob data into a io.Writer object.
+// This enables using io.Writer based custom types for scanning Lobs instead of using a Lob object.
+// For usage please refer to the example.
+func ScanLobWriter(src any, wr io.Writer) error {
+	if wr == nil {
+		return fmt.Errorf("lob scan error: parameter wr %T is nil", wr)
+	}
+	return scanLob(src, wr)
+}
 
 // A Lob is the driver representation of a database large object field.
 // A Lob object uses an io.Reader object as source for writing content to a database lob field.
@@ -52,20 +100,11 @@ func (l *Lob) SetWriter(wr io.Writer) *Lob {
 }
 
 // Scan implements the database/sql/Scanner interface.
-func (l *Lob) Scan(src interface{}) error {
+func (l *Lob) Scan(src any) error {
 	if l.wr == nil {
-		return fmt.Errorf("lob error: initial writer %[1]T %[1]v", l)
+		l.wr = new(bytes.Buffer)
 	}
-
-	ws, ok := src.(p.WriterSetter)
-	if !ok {
-		return fmt.Errorf("lob: invalid scan type %T", src)
-	}
-
-	if err := ws.SetWriter(l.wr); err != nil {
-		return err
-	}
-	return nil
+	return ScanLobWriter(src, l.wr)
 }
 
 // Value implements the database/sql/Valuer interface.
@@ -82,15 +121,18 @@ type NullLob struct {
 }
 
 // Scan implements the database/sql/Scanner interface.
-func (l *NullLob) Scan(src interface{}) error {
+func (l *NullLob) Scan(src any) error {
 	if src == nil {
 		l.Valid = false
 		return nil
 	}
+	if l.Lob == nil {
+		l.Lob = &Lob{}
+	}
+	l.Valid = true
 	if err := l.Lob.Scan(src); err != nil {
 		return err
 	}
-	l.Valid = true
 	return nil
 }
 

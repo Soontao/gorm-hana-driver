@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: 2014-2022 SAP SE
-//
-// SPDX-License-Identifier: Apache-2.0
-
 package driver
 
 import (
@@ -14,7 +10,7 @@ import (
 type Decimal big.Rat
 
 // Scan implements the database/sql/Scanner interface.
-func (d *Decimal) Scan(src interface{}) error {
+func (d *Decimal) Scan(src any) error {
 	r, ok := src.(*big.Rat)
 	if !ok {
 		return fmt.Errorf("decimal: invalid data type %T", src)
@@ -37,7 +33,7 @@ type NullDecimal struct {
 }
 
 // Scan implements the Scanner interface.
-func (n *NullDecimal) Scan(value interface{}) error {
+func (n *NullDecimal) Scan(value any) error {
 	if value == nil {
 		n.Valid = false
 		return nil
@@ -47,7 +43,7 @@ func (n *NullDecimal) Scan(value interface{}) error {
 		return fmt.Errorf("decimal: invalid data type %T", value)
 	}
 	if n.Decimal == nil {
-		return fmt.Errorf("invalid decimal value %v", n.Decimal)
+		n.Decimal = &Decimal{}
 	}
 	n.Valid = true
 	(*big.Rat)(n.Decimal).Set(r)
